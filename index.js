@@ -1,5 +1,5 @@
 require('dotenv').config();
-const createServer = require('./src/server');
+const createServer = require('./server');
 
 const config = {
   // Strapi

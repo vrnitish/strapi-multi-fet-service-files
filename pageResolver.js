@@ -2,95 +2,111 @@
  * PageResolver
  *
  * Strategy:
- * 1. Fetch page shell (layout rows/cols with embedded component_instance stubs)
- *    — Strapi already returns this in one query since layout is a component (not a relation)
- * 2. Walk the layout tree to collect all component_instance documentIds
- * 3. Batch-fetch all component instances IN PARALLEL (same depth level together)
- * 4. For any fetched instance that is a composition-wrapper (has inner layout),
- *    collect the inner component_instance documentIds and batch-fetch those in parallel
- * 5. Reassemble the full resolved tree matching the original response shape
- *    so Next.js needs zero changes
+ * 1. Fetch the page shell — layout tree iteratively deepened until
+ *    component_instance stubs are visible at every level.
+ * 2. Recursively resolve ALL component_instance stubs in the tree:
+ *    - Find all stubs not yet fetched
+ *    - Batch-fetch them in parallel
+ *    - Recursively resolve stubs inside each fetched instance
+ *    - Repeat until no stubs remain (handles any nesting depth)
+ * 3. Replace every stub with its fully-resolved data.
+ *
+ * The resolved cache (documentId → data) prevents duplicate fetches and
+ * handles circular references safely.
  */
-
-const WRAPPER_COMPONENT = 'components.composition-wrapper';
 
 class PageResolver {
   constructor(strapiClient, options = {}) {
     this.strapi = strapiClient;
-    this.maxDepth = options.maxDepth || 5;
   }
 
   /**
    * Main entry point.
-   * Returns a page object with the same shape as the original deep Strapi response,
-   * but assembled via parallel flat fetches instead of recursive populate.
    */
   async resolvePage(slug, locale = 'en') {
     const startTime = Date.now();
 
-    // ── Step 1: Fetch page shell ──────────────────────────────────────────────
-    // layout[] is a Strapi component (not a relation), so Strapi returns it
-    // inline with populate=layout. No depth issue here.
     const page = await this.strapi.fetchPageBySlug(slug, locale);
     console.log(`[Resolver] Page shell fetched in ${Date.now() - startTime}ms`);
 
-    // ── Step 2: Collect all level-1 component_instance stubs ─────────────────
-    // These are the component_instances sitting directly inside page.layout cols
-    const level1Stubs = this._collectInstanceStubs(page.layout || []);
-    console.log(`[Resolver] Found ${level1Stubs.length} level-1 component instances`);
+    // cache: documentId → fully resolved instance data (null = fetch failed)
+    const cache = {};
+    const resolvedPage = await this._deepResolve(page, locale, cache);
 
-    // ── Step 3: Batch-fetch all level-1 instances IN PARALLEL ────────────────
-    const level1DocIds = level1Stubs.map((s) => s.documentId);
-    const level1Map = await this.strapi.fetchComponentInstancesBatch(
-      level1DocIds,
-      locale
+    console.log(
+      `[Resolver] Done — ${Object.keys(cache).length} component instance(s) resolved in ${Date.now() - startTime}ms`
     );
-    console.log(`[Resolver] Level-1 batch fetched in ${Date.now() - startTime}ms`);
-
-    // ── Step 4: Find any composition-wrappers among level-1, collect level-2 ─
-    const level2Stubs = this._collectInnerStubs(level1Map);
-    console.log(`[Resolver] Found ${level2Stubs.length} level-2 component instances`);
-
-    let level2Map = {};
-    if (level2Stubs.length > 0) {
-      const level2DocIds = level2Stubs.map((s) => s.documentId);
-      level2Map = await this.strapi.fetchComponentInstancesBatch(
-        level2DocIds,
-        locale
-      );
-      console.log(`[Resolver] Level-2 batch fetched in ${Date.now() - startTime}ms`);
-    }
-
-    // ── Step 5: Reassemble the full tree ─────────────────────────────────────
-    const resolvedPage = this._assemblePage(page, level1Map, level2Map);
-    console.log(`[Resolver] Total resolution time: ${Date.now() - startTime}ms`);
-
     return resolvedPage;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // PRIVATE: Tree traversal helpers
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // PRIVATE
+  // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Walk page.layout[] → rows → columns and collect every component_instance stub.
-   * Returns array of { documentId, id, _path } for tracking.
+   * Recursively resolve all component_instance stubs in `data`.
+   * Fetches in waves: collect all new stubs → batch-fetch → recurse into
+   * each fetched instance → replace. Repeats until no new stubs are found.
    *
-   * NOTE: The stub already contains the documentId — Strapi embeds it inline
-   * even at shallow populate depth. We use this to fetch the full data.
+   * @param {*}      data   - any Strapi response fragment
+   * @param {string} locale
+   * @param {object} cache  - shared documentId → resolved data map
    */
-  _collectInstanceStubs(layoutRows) {
+  async _deepResolve(data, locale, cache) {
+    const stubs = this._findAllCIStubs(data);
+    const newIds = [...new Set(stubs.map((s) => s.documentId))].filter(
+      (id) => !(id in cache)
+    );
+
+    if (newIds.length === 0) {
+      return this._replaceCIStubs(data, cache);
+    }
+
+    console.log(`[Resolver] Fetching ${newIds.length} component instance(s)`);
+
+    // Reserve cache slots before async work to prevent duplicate fetches
+    // in concurrent recursive calls (same id found in multiple branches).
+    for (const id of newIds) cache[id] = null;
+
+    const rawMap = await this.strapi.fetchComponentInstancesBatch(newIds, locale);
+
+    // Recursively resolve each fetched instance before inserting into cache.
+    // This handles nested CIs at any depth.
+    await Promise.all(
+      newIds.map(async (id) => {
+        if (rawMap[id]) {
+          cache[id] = await this._deepResolve(rawMap[id], locale, cache);
+        }
+      })
+    );
+
+    return this._replaceCIStubs(data, cache);
+  }
+
+  /**
+   * Walk the tree and collect every { documentId, ... } object found under
+   * a key named "component_instance". Does not recurse into those objects.
+   */
+  _findAllCIStubs(data, visited = new WeakSet()) {
+    if (!data || typeof data !== 'object') return [];
+    if (visited.has(data)) return [];
+    visited.add(data);
+
     const stubs = [];
 
-    for (const row of layoutRows) {
-      for (const col of row.columns || []) {
-        const ci = col.component_instance;
-        if (ci?.documentId) {
-          stubs.push({
-            id: ci.id,
-            documentId: ci.documentId,
-          });
-        }
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        stubs.push(...this._findAllCIStubs(item, visited));
+      }
+      return stubs;
+    }
+
+    for (const [key, value] of Object.entries(data)) {
+      if (!value || typeof value !== 'object') continue;
+      if (key === 'component_instance' && value.documentId) {
+        stubs.push(value);
+      } else {
+        stubs.push(...this._findAllCIStubs(value, visited));
       }
     }
 
@@ -98,113 +114,34 @@ class PageResolver {
   }
 
   /**
-   * Given the map of fetched level-1 component instances,
-   * find those that are composition-wrappers and collect their inner CI stubs.
+   * Walk the tree and replace every component_instance stub with the
+   * resolved data from cache. Falls back to the original stub on failure.
    */
-  _collectInnerStubs(instanceMap) {
-    const stubs = [];
+  _replaceCIStubs(data, cache, visited = new WeakSet()) {
+    if (!data || typeof data !== 'object') return data;
+    if (visited.has(data)) return data;
+    visited.add(data);
 
-    for (const [, instance] of Object.entries(instanceMap)) {
-      if (!instance) continue;
+    if (Array.isArray(data)) {
+      return data.map((item) => this._replaceCIStubs(item, cache, visited));
+    }
 
-      const components = instance.components || [];
-      for (const comp of components) {
-        if (comp.__component === WRAPPER_COMPONENT) {
-          // This is a wrapper — it has its own inner layout
-          const innerStubs = this._collectInstanceStubs(comp.layout || []);
-          stubs.push(...innerStubs);
+    const result = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (key === 'component_instance' && value?.documentId) {
+        const resolved = cache[value.documentId];
+        if (resolved == null) {
+          console.warn(`[Resolver] Missing data for component: ${value.documentId}`);
         }
+        result[key] = resolved ?? value;
+      } else if (value && typeof value === 'object') {
+        result[key] = this._replaceCIStubs(value, cache, visited);
+      } else {
+        result[key] = value;
       }
     }
 
-    // Deduplicate by documentId (a component instance may appear in multiple wrappers)
-    const seen = new Set();
-    return stubs.filter(({ documentId }) => {
-      if (seen.has(documentId)) return false;
-      seen.add(documentId);
-      return true;
-    });
-  }
-
-  /**
-   * Reassemble the full page tree, substituting stub component_instances
-   * with fully-fetched data. Preserves the original response shape exactly.
-   */
-  _assemblePage(page, level1Map, level2Map) {
-    const resolvedLayout = (page.layout || []).map((row) => ({
-      ...row,
-      columns: (row.columns || []).map((col) => ({
-        ...col,
-        component_instance: col.component_instance
-          ? this._resolveInstance(
-              col.component_instance,
-              level1Map,
-              level2Map
-            )
-          : null,
-      })),
-    }));
-
-    return {
-      ...page,
-      layout: resolvedLayout,
-    };
-  }
-
-  /**
-   * Resolve a single component instance stub into full data.
-   * If it's a wrapper, also resolve its inner component instances.
-   */
-  _resolveInstance(stub, level1Map, level2Map) {
-    const full = level1Map[stub.documentId];
-
-    if (!full) {
-      // Fetch failed or not found — return stub as-is so page doesn't break
-      console.warn(`[Resolver] Missing data for component: ${stub.documentId}`);
-      return stub;
-    }
-
-    // Resolve inner components if this is a wrapper
-    const resolvedComponents = (full.components || []).map((comp) => {
-      if (comp.__component !== WRAPPER_COMPONENT) {
-        return comp; // Leaf component — return as-is
-      }
-
-      // Composition wrapper — resolve its inner layout
-      return {
-        ...comp,
-        layout: (comp.layout || []).map((innerRow) => ({
-          ...innerRow,
-          columns: (innerRow.columns || []).map((innerCol) => ({
-            ...innerCol,
-            component_instance: innerCol.component_instance
-              ? this._resolveInnerInstance(innerCol.component_instance, level2Map)
-              : null,
-          })),
-        })),
-      };
-    });
-
-    return {
-      ...full,
-      components: resolvedComponents,
-    };
-  }
-
-  /**
-   * Resolve a level-2 (inner wrapper) component instance stub.
-   */
-  _resolveInnerInstance(stub, level2Map) {
-    const full = level2Map[stub.documentId];
-
-    if (!full) {
-      console.warn(
-        `[Resolver] Missing inner component data for: ${stub.documentId}`
-      );
-      return stub;
-    }
-
-    return full;
+    return result;
   }
 }
 

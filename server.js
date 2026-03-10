@@ -65,7 +65,12 @@ function createServer(config) {
       // Return in same envelope shape as original Strapi response
       return res.json({ data: [pageData] });
     } catch (err) {
-      console.error(`[Server] Error resolving page ${slug}:`, err.message);
+      const strapiBody = err.response?.data;
+      console.error(
+        `[Server] Error resolving page ${slug}:`,
+        err.message,
+        strapiBody ? JSON.stringify(strapiBody) : ''
+      );
 
       if (err.message.includes('not found')) {
         return res.status(404).json({ error: err.message });
