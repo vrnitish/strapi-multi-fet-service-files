@@ -2,9 +2,9 @@
  * Strapi Page Resolver — Express HTTP Server
  *
  * Routes:
- *   GET  /page?slug=/your-page/&locale=en   → Resolved page JSON
- *   POST /webhook/strapi                     → Cache invalidation on publish
- *   GET  /health                             → Health check
+ *   GET  /resolve/:collection?<filters>&locale=en  → Resolved entry JSON
+ *   POST /webhook/strapi                            → Cache invalidation on publish
+ *   GET  /health                                    → Health check
  */
 
 const express = require('express');
@@ -23,9 +23,7 @@ function createServer(config) {
     timeout: config.strapiTimeout || 10000,
   });
 
-  const resolver = new PageResolver(strapiClient, {
-    maxDepth: config.maxDepth || 5,
-  });
+  const resolver = new PageResolver(strapiClient);
 
   const cache = new CacheManager({
     enabled: config.cacheEnabled !== false,
@@ -36,38 +34,39 @@ function createServer(config) {
   // ── Routes ─────────────────────────────────────────────────────────────────
 
   /**
-   * GET /page?slug=/your-slug/&locale=en
-   * Returns the fully resolved page matching the original Strapi response shape.
+   * GET /resolve/:collection?<filters>&locale=en
+   * Generic route — resolves any Strapi collection entry with full CI tree.
+   * All query params except `locale` are treated as Strapi filters.
+   *
+   * Examples:
+   *   GET /resolve/pages?slug=/my-page/&locale=en
+   *   GET /resolve/articles?category=tech&locale=hi
+   *   GET /resolve/landing-pages?slug=/promo/&site_code=adv
    */
-  app.get('/page', async (req, res) => {
-    const slug = req.query.slug;
-    const locale = req.query.locale || 'en';
+  app.get('/resolve/:collection', async (req, res) => {
+    const { collection } = req.params;
+    const { locale = 'en', ...filters } = req.query;
 
-    if (!slug) {
-      return res.status(400).json({ error: 'slug query param is required' });
+    if (Object.keys(filters).length === 0) {
+      return res.status(400).json({ error: 'At least one filter query param is required' });
     }
 
     try {
-      // ── Cache check ──────────────────────────────────────────────────────
-      const cached = await cache.get(slug, locale);
+      const cacheKey = `${collection}:${JSON.stringify(filters)}`;
+      const cached = await cache.get(cacheKey, locale);
       if (cached) {
         res.set('X-Cache', 'HIT');
-        return res.json({ data: [cached] }); // Preserve Strapi array envelope
+        return res.json({ data: [cached] });
       }
 
-      // ── Resolve from Strapi ──────────────────────────────────────────────
       res.set('X-Cache', 'MISS');
-      const pageData = await resolver.resolvePage(slug, locale);
-
-      // ── Store in cache ───────────────────────────────────────────────────
-      await cache.set(slug, locale, pageData);
-
-      // Return in same envelope shape as original Strapi response
-      return res.json({ data: [pageData] });
+      const data = await resolver.resolve(collection, filters, locale);
+      await cache.set(cacheKey, locale, data);
+      return res.json({ data: [data] });
     } catch (err) {
       const strapiBody = err.response?.data;
       console.error(
-        `[Server] Error resolving page ${slug}:`,
+        `[Server] Error resolving ${collection}:`,
         err.message,
         strapiBody ? JSON.stringify(strapiBody) : ''
       );

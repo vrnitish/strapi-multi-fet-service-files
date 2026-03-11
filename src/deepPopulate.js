@@ -99,6 +99,64 @@ function collectStubPaths(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Deep-path detection (Problem A+) — proactive deepening for absent relations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Walk the tree and collect paths to every field containing an array of
+ * real (non-stub) objects. These represent fields whose items may have
+ * absent sub-relations that `populate=*` didn't reveal.
+ *
+ * Unlike collectStubPaths (which finds under-populated stubs), this finds
+ * fully-populated objects that could still have missing nested relations.
+ * Used in the iterative deepening loop to proactively reveal tree structure
+ * one level at a time.
+ */
+function collectDeepPaths(
+  data,
+  { segments = [], visited = new WeakSet(), stopAtFields = new Set() } = {}
+) {
+  if (!data || typeof data !== 'object') return [];
+  if (visited.has(data)) return [];
+  visited.add(data);
+
+  const paths = [];
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      paths.push(...collectDeepPaths(item, { segments, visited, stopAtFields }));
+    }
+    return paths;
+  }
+
+  for (const [key, value] of Object.entries(data)) {
+    if (SYSTEM_KEYS.has(key) || value == null) continue;
+    if (stopAtFields.has(key)) continue;
+
+    const nextSegments = [...segments, key];
+
+    if (Array.isArray(value)) {
+      const realObjs = value.filter(
+        (v) => v && typeof v === 'object' && !Array.isArray(v) && !isStub(v)
+      );
+      if (realObjs.length > 0) {
+        paths.push(nextSegments);
+        // Recurse into items to find deeper real-object arrays
+        for (const item of realObjs) {
+          paths.push(...collectDeepPaths(item, { segments: nextSegments, visited, stopAtFields }));
+        }
+      }
+    } else if (typeof value === 'object' && !isStub(value)) {
+      // Single real object — deepen it and recurse to find deeper arrays within it
+      paths.push(nextSegments);
+      paths.push(...collectDeepPaths(value, { segments: nextSegments, visited, stopAtFields }));
+    }
+  }
+
+  return paths;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Absent relation detection (Problem B)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -150,22 +208,14 @@ function collectContainerPaths(
         (v) => v && typeof v === 'object' && !Array.isArray(v) && !isStub(v)
       );
       if (realObjs.length > 0) {
-        // At depth 1 (direct page/component fields), only add as CI container
-        // if items are leaf arrays — i.e. no further nested arrays of real
-        // objects. This prevents "Invalid key component_instance at layout"
-        // 400 errors when the depth-1 field is a Strapi dynamic zone.
-        //
-        // At depth 2+, always add as CI container even if items have
-        // sub-arrays — nested component arrays can have component_instance
-        // at any level regardless of further nesting below them.
-        const hasNestedArrays = realObjs.some((v) =>
-          Object.values(v).some(
-            (fv) =>
-              Array.isArray(fv) &&
-              fv.some((fvi) => fvi && typeof fvi === 'object' && !Array.isArray(fvi) && !isStub(fvi))
-          )
-        );
-        if (!hasNestedArrays || nextSegments.length > 1) {
+        // Dynamic zones (items have __component) cannot be targeted with
+        // direct field populates like component_instance — Strapi rejects
+        // them with "Invalid key … at <field>". Skip them as CI containers.
+        // The Fragment API handles CI populate inside dynamic zones instead
+        // (see fetchComponentInstance).
+        const isDynamicZone = realObjs.some((v) => '__component' in v);
+
+        if (!isDynamicZone) {
           paths.push(nextSegments);
         }
       }
@@ -187,7 +237,12 @@ function collectContainerPaths(
  * For each container path, build URLSearchParams entries that will fetch
  * a known relation field (e.g. component_instance) with only its documentId.
  *
- * Generates: populate[…container…][populate][ciField][fields][0]=documentId
+ * Generates:
+ *   populate[…container…][populate][ciField][fields][0]=documentId
+ *   populate[…container…][populate][ciField][fields][1]=component_title
+ *
+ * Both fields are requested so the resolver can identify CI entities by shape
+ * (documentId + component_title) regardless of the field name used.
  *
  * @param {string[][]} containerPaths  - output of collectContainerPaths()
  * @param {string}     ciField         - relation field name to fetch (default: 'component_instance')
@@ -198,13 +253,13 @@ function buildCIPopulateEntries(containerPaths, ciField = 'component_instance') 
   const seen = new Set();
 
   for (const segments of containerPaths) {
-    // populate[a][populate][b][populate] + [component_instance][fields][0]
     const base = segmentsToPopulateKey(segments);
-    const key = `${base}[${ciField}][fields][0]`;
+    const key0 = `${base}[${ciField}][fields][0]`;
 
-    if (!seen.has(key)) {
-      seen.add(key);
-      entries.push([key, 'documentId']);
+    if (!seen.has(key0)) {
+      seen.add(key0);
+      entries.push([key0, 'documentId']);
+      entries.push([`${base}[${ciField}][fields][1]`, 'component_title']);
     }
   }
 
@@ -228,10 +283,10 @@ function segmentsToPopulateKey(segments) {
 /**
  * Build URLSearchParams for a deep-populate re-fetch.
  *
- * @param {string[][]} stubPaths          - accumulated stub paths from all passes
+ * @param {string[][]} stubPaths          - accumulated paths from all passes
  * @param {object}     opts
  * @param {string}     [opts.locale]
- * @param {string}     [opts.slug]            - adds filters[slug][$eq] (page fetches)
+ * @param {object}     [opts.filters]         - Strapi filter fields (e.g. { slug: '/page/' })
  * @param {string}     [opts.basePopulateKey] - e.g. 'populate[layout][populate]'
  * @param {string}     [opts.basePopulateValue] - default '*'
  * @param {Array<[string,string]>} [opts.extraEntries] - additional key/value params
@@ -239,7 +294,7 @@ function segmentsToPopulateKey(segments) {
 function buildDeepPopulateParams(stubPaths, opts = {}) {
   const {
     locale,
-    slug,
+    filters = {},
     basePopulateKey,
     basePopulateValue = '*',
     extraEntries = [],
@@ -247,7 +302,9 @@ function buildDeepPopulateParams(stubPaths, opts = {}) {
 
   const params = new URLSearchParams();
 
-  if (slug)   params.set('filters[slug][$eq]', slug);
+  for (const [field, value] of Object.entries(filters)) {
+    params.set(`filters[${field}][$eq]`, value);
+  }
   if (locale) params.set('locale', locale);
   if (basePopulateKey) params.set(basePopulateKey, basePopulateValue);
 
@@ -300,38 +357,15 @@ function leafPaths(paths) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Returns true if `value` looks like a shallow-populated relation:
- *   - An object or array of objects that have an `id`
- *   - Each object has 1–3 non-system content fields (under-populated)
- *   - None have `__component` (embedded components are never shallow)
- *
- * Used to detect fields like `layout: [{ id, row_title }]` that need deeper
- * populate via the Strapi Fragment API.
- */
-function isShallowRelation(value) {
-  const items = Array.isArray(value)
-    ? value.filter((v) => v && typeof v === 'object' && !Array.isArray(v))
-    : value && typeof value === 'object' && !Array.isArray(value)
-    ? [value]
-    : [];
-  if (items.length === 0) return false;
-  return items.every((item) => {
-    if ('__component' in item) return false; // embedded component, not a relation
-    if (!item.id) return false;
-    const contentKeys = Object.keys(item).filter((k) => !SYSTEM_KEYS.has(k));
-    return contentKeys.length >= 1 && contentKeys.length <= 3;
-  });
-}
-
-/**
- * Walk a `components[]` array (from a component-instance response).
- * For each `__component` UID, detect fields containing shallow-relation data
- * and generate Fragment populate entries to fetch them fully.
+ * Walk a `components[]` array and find ALL paths that need deeper population:
+ * both arrays/objects of real data (collectDeepPaths) AND under-populated
+ * stubs (collectStubPaths). Build Fragment API populate entries for the
+ * leaf paths so the next fetch reveals one more level of data.
  *
  * Output example:
  *   ['populate[components][on][components.composition-wrapper][populate][layout][populate]', '*']
  */
-function buildFragmentDeepEntries(components) {
+function buildFragmentDeepPathEntries(components, stopAtFields = new Set()) {
   const entries = [];
   const seen = new Set();
 
@@ -339,14 +373,17 @@ function buildFragmentDeepEntries(components) {
     if (!comp || !comp.__component) continue;
     const uid = comp.__component;
 
-    for (const [field, value] of Object.entries(comp)) {
-      if (SYSTEM_KEYS.has(field) || field === '__component' || value == null) continue;
-      if (isShallowRelation(value)) {
-        const key = `populate[components][on][${uid}][populate][${field}][populate]`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          entries.push([key, '*']);
-        }
+    const deepPaths = collectDeepPaths(comp, { stopAtFields });
+    const stubPaths = collectStubPaths(comp, { stopAtFields });
+    const allPaths = uniquePaths([...deepPaths, ...stubPaths]);
+    const leaves = leafPaths(allPaths);
+
+    for (const segments of leaves) {
+      const innerPath = segments.join('][populate][');
+      const key = `populate[components][on][${uid}][populate][${innerPath}][populate]`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        entries.push([key, '*']);
       }
     }
   }
@@ -381,10 +418,14 @@ function buildFragmentCIEntries(
     const containerPaths = collectContainerPaths(comp, { stopAtFields });
     for (const segments of containerPaths) {
       const innerPath = segments.join('][populate][');
-      const key = `populate[components][on][${uid}][populate][${innerPath}][populate][${ciField}][fields][0]`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        entries.push([key, 'documentId']);
+      const key0 = `populate[components][on][${uid}][populate][${innerPath}][populate][${ciField}][fields][0]`;
+      if (!seen.has(key0)) {
+        seen.add(key0);
+        entries.push([key0, 'documentId']);
+        entries.push([
+          `populate[components][on][${uid}][populate][${innerPath}][populate][${ciField}][fields][1]`,
+          'component_title',
+        ]);
       }
     }
   }
@@ -393,11 +434,12 @@ function buildFragmentCIEntries(
 }
 
 module.exports = {
-  isStub,
   collectStubPaths,
+  collectDeepPaths,
   collectContainerPaths,
+  uniquePaths,
   buildCIPopulateEntries,
   buildDeepPopulateParams,
-  buildFragmentDeepEntries,
+  buildFragmentDeepPathEntries,
   buildFragmentCIEntries,
 };
