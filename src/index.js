@@ -6,11 +6,17 @@ const config = {
   strapiUrl: process.env.STRAPI_URL || 'http://localhost:1337',
   strapiToken: process.env.STRAPI_TOKEN || '',
   strapiTimeout: parseInt(process.env.STRAPI_TIMEOUT || '10000'),
+  componentCollection: process.env.COMPONENT_COLLECTION || 'component-instances',
+  componentZoneField: process.env.COMPONENT_ZONE_FIELD || 'components',
+  componentTypeField: process.env.COMPONENT_TYPE_FIELD || '__component',
+  entityLabelField: process.env.ENTITY_LABEL_FIELD || 'component_title',
+  localizationField: process.env.LOCALIZATION_FIELD || 'localizations',
 
   // Cache
   cacheEnabled: process.env.CACHE_ENABLED !== 'false',
   redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
   cacheTtl: parseInt(process.env.CACHE_TTL || '300'),
+  cacheKeyField: process.env.CACHE_KEY_FIELD || 'slug',
 
   // Security
   webhookSecret: process.env.WEBHOOK_SECRET || '',

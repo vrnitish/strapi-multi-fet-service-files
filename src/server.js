@@ -21,6 +21,11 @@ function createServer(config) {
     baseUrl: config.strapiUrl,
     token: config.strapiToken,
     timeout: config.strapiTimeout || 10000,
+    componentCollection: config.componentCollection,
+    componentZoneField: config.componentZoneField,
+    componentTypeField: config.componentTypeField,
+    entityLabelField: config.entityLabelField,
+    localizationField: config.localizationField,
   });
 
   const resolver = new PageResolver(strapiClient);
@@ -56,13 +61,26 @@ function createServer(config) {
       const cached = await cache.get(cacheKey, locale);
       if (cached) {
         res.set('X-Cache', 'HIT');
-        return res.json({ data: [cached] });
+        if (cached && Array.isArray(cached.data)) {
+          return res.json(cached);
+        }
+        return res.json({
+          data: [cached],
+          meta: {
+            pagination: {
+              page: 1,
+              pageCount: 1,
+              pageSize: 1,
+              total: 1,
+            },
+          },
+        });
       }
 
       res.set('X-Cache', 'MISS');
-      const data = await resolver.resolve(collection, filters, locale);
-      await cache.set(cacheKey, locale, data);
-      return res.json({ data: [data] });
+      const response = await resolver.resolveWithMeta(collection, filters, locale);
+      await cache.set(cacheKey, locale, response);
+      return res.json(response);
     } catch (err) {
       const strapiBody = err.response?.data;
       console.error(
@@ -84,7 +102,7 @@ function createServer(config) {
    * Called by Strapi lifecycle hooks or webhooks on content publish.
    * Invalidates relevant cache entries.
    *
-   * Body: { model: 'page' | 'component-instance', entry: { slug?, locale? } }
+   * Body: { entry: { <cacheKeyField>?, locale? } }
    */
   app.post('/webhook/strapi', async (req, res) => {
     const secret = req.headers['x-webhook-secret'];
@@ -92,22 +110,19 @@ function createServer(config) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const { model, entry } = req.body;
+    const { entry } = req.body;
 
     try {
-      if (model === 'page' && entry?.slug) {
-        // Specific page updated — invalidate just that page
+      const resourceKey =
+        entry && typeof entry === 'object' ? entry[config.cacheKeyField || 'slug'] : null;
+
+      if (resourceKey) {
         const locale = entry.locale || 'en';
-        await cache.invalidate(entry.slug, locale);
-        console.log(`[Webhook] Invalidated page: ${entry.slug}`);
-      } else if (
-        model === 'component-instance' ||
-        model === 'component-wrapper'
-      ) {
-        // Shared component updated — invalidate ALL pages since we don't
-        // know which pages reference this component
+        await cache.invalidate(resourceKey, locale);
+        console.log(`[Webhook] Invalidated cache key: ${resourceKey}`);
+      } else {
         await cache.invalidateAll();
-        console.log(`[Webhook] Shared component updated — invalidated all pages`);
+        console.log('[Webhook] Entry key unavailable — invalidated all pages');
       }
 
       return res.status(200).json({ ok: true });

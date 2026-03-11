@@ -2,17 +2,11 @@ const axios = require('axios');
 const {
   collectStubPaths,
   collectDeepPaths,
-  collectContainerPaths,
   uniquePaths,
-  buildCIPopulateEntries,
   buildDeepPopulateParams,
   buildFragmentDeepPathEntries,
-  buildFragmentCIEntries,
+  normalizeSchema,
 } = require('./deepPopulate');
-
-// Stop the layout scan at component_instance / component_instances fields.
-// The resolver batch-fetches those separately — we only need the stubs.
-const CI_STOP_FIELDS = new Set(['component_instance', 'component_instances']);
 
 class StrapiClient {
   constructor(config) {
@@ -20,6 +14,13 @@ class StrapiClient {
     this.token = config.token;
     this.timeout = config.timeout || 10000;
     this.maxPopulatePasses = config.maxPopulatePasses || 50;
+    this.schema = normalizeSchema({
+      entityLabelField: config.entityLabelField,
+      localizationField: config.localizationField,
+      componentTypeField: config.componentTypeField,
+      componentZoneField: config.componentZoneField,
+    });
+    this.componentCollection = config.componentCollection || 'component-instances';
 
     this.http = axios.create({
       baseURL: this.baseUrl,
@@ -36,26 +37,40 @@ class StrapiClient {
     });
   }
 
+  _buildLocalizationPopulateEntry() {
+    return [`populate[${this.schema.localizationField}]`, '*'];
+  }
+
   /**
-   * Deep-merge two Strapi responses, preserving the richer version of each field.
-   * Used to combine breadth (from populate=*) with depth (from targeted populates)
-   * without losing data across passes.
+   * Deep-merge two Strapi responses.
+   * Keeps earlier data only when the newer payload omits a key entirely.
+   * Explicit newer values such as null and [] must win, otherwise relations
+   * that are intentionally empty disappear behind stale data from prior passes.
    */
   _mergeResponses(base, update) {
-    if (update == null) return base;
-    if (base == null) return update;
-    if (typeof base !== 'object' || typeof update !== 'object') return update;
+    if (update === undefined) return base;
+    if (base === undefined) return update;
+    if (
+      base == null ||
+      update == null ||
+      typeof base !== 'object' ||
+      typeof update !== 'object'
+    ) {
+      return update;
+    }
     if (Array.isArray(base) || Array.isArray(update)) {
       if (!Array.isArray(base) || !Array.isArray(update)) return update;
-      const len = Math.max(base.length, update.length);
-      return Array.from({ length: len }, (_, i) =>
-        this._mergeResponses(base[i], update[i])
-      );
+      return update.map((item, i) => this._mergeResponses(base[i], item));
     }
     const result = { ...base };
     for (const [key, val] of Object.entries(update)) {
-      if (val == null) continue;
-      if (key in result && result[key] != null && typeof result[key] === 'object' && typeof val === 'object') {
+      if (
+        key in result &&
+        result[key] != null &&
+        val != null &&
+        typeof result[key] === 'object' &&
+        typeof val === 'object'
+      ) {
         result[key] = this._mergeResponses(result[key], val);
       } else {
         result[key] = val;
@@ -64,34 +79,29 @@ class StrapiClient {
     return result;
   }
 
-  /**
-   * Fetch any Strapi collection entry with the full nested tree, exposing
-   * component_instance stubs at every nesting level — for any unknown schema
-   * depth or field names.
-   *
-   * @param {string} collection  - Strapi collection plural name (e.g. 'pages', 'articles')
-   * @param {object} opts
-   * @param {object} [opts.filters]  - Strapi filter fields (e.g. { slug: '/my-page/' })
-   * @param {string} [opts.locale]   - Locale code (default: 'en')
-   *
-   * Three-phase strategy:
-   *
-   * Phase 1 — Broad populate:
-   *   `populate=*` fetches all top-level relations one level deep.
-   *   No hardcoded field names — works for any schema.
-   *
-   * Phase 2 — Iterative stub deepening:
-   *   Scans for stub objects (id/documentId only, no content) and re-fetches
-   *   with deeper populate params. Merges responses to preserve breadth.
-   *   Repeats until no new stubs are found.
-   *
-   * Phase 3 — Absent relation populate:
-   *   Strapi OMITS unpopulated relation fields entirely — stubs are never
-   *   returned for them, so Phase 2 can't detect them. After the full tree
-   *   is visible, find every container array and add explicit
-   *   component_instance populate to surface CI stubs.
-   */
-  async fetchEntry(collection, { filters = {}, locale = 'en' } = {}) {
+  async _populateLocalizationsForEntry(collection, entry, { filters = {}, locale = 'en' } = {}) {
+    try {
+      const res = await this.http.get(
+        `/api/${collection}?${buildDeepPopulateParams([], {
+          locale,
+          filters,
+          extraEntries: [this._buildLocalizationPopulateEntry()],
+        })}`
+      );
+      const data = res.data?.data;
+      const localizationEntry = Array.isArray(data) ? data[0] : data;
+      return localizationEntry ? this._mergeResponses(entry, localizationEntry) : entry;
+    } catch (err) {
+      console.warn(
+        `[Strapi] ${collection} localization populate skipped (${err.response?.status ?? err.message})`
+      );
+      return entry;
+    }
+  }
+
+  async _fetchEntryEnvelope(collection, { filters = {}, locale = 'en' } = {}) {
+    let meta;
+
     // ── Phase 1: Broad populate ───────────────────────────────────────────
     const params1 = new URLSearchParams();
     for (const [field, value] of Object.entries(filters)) {
@@ -102,20 +112,28 @@ class StrapiClient {
 
     const firstRes = await this.http.get(`/api/${collection}?${params1}`);
     const firstData = firstRes.data?.data;
+    meta = firstRes.data?.meta;
 
     let entry = Array.isArray(firstData) ? firstData[0] : firstData;
     if (!entry) {
       throw new Error(`No entry found in ${collection} with filters: ${JSON.stringify(filters)}`);
     }
 
+    // populate=* does not reliably include i18n localizations, so fetch them explicitly
+    entry = await this._populateLocalizationsForEntry(collection, entry, { filters, locale });
+
     // ── Phase 2: Iterative deepening ─────────────────────────────────────
     // Detects both stubs (under-populated entities) AND real-object arrays
     // whose items may have absent sub-relations. Deepens one level per pass;
     // merge preserves breadth from earlier passes.
+    // stopAtEntities: false — the page-level scanner traverses THROUGH all
+    // relations regardless of which collection they belong to. Strapi resolves
+    // cross-collection populate params transparently, so we don't need to
+    // know the collection name for any nested relation.
     let allPaths = [];
     for (let pass = 2; pass <= this.maxPopulatePasses; pass++) {
-      const stubPaths = collectStubPaths(entry, { stopAtFields: CI_STOP_FIELDS });
-      const deepPaths = collectDeepPaths(entry, { stopAtFields: CI_STOP_FIELDS });
+      const stubPaths = collectStubPaths(entry, { schema: this.schema, stopAtEntities: false });
+      const deepPaths = collectDeepPaths(entry, { schema: this.schema, stopAtEntities: false });
       const combined = uniquePaths([...stubPaths, ...deepPaths]);
 
       // Check if any truly new paths were discovered
@@ -135,117 +153,135 @@ class StrapiClient {
       entry = this._mergeResponses(entry, newEntry);
     }
 
-    // ── Phase 3: Expose CI stubs at all container levels ──────────────────
-    // After the tree is fully revealed, find non-dynamic-zone containers
-    // and add explicit CI populate to surface component_instance stubs.
-    const containerPaths = collectContainerPaths(entry, { stopAtFields: CI_STOP_FIELDS });
-    const ciEntries = buildCIPopulateEntries(containerPaths);
-
-    if (ciEntries.length > 0) {
-      console.log(
-        `[Strapi] ${collection} CI pass: adding CI populate at ${ciEntries.length / 2} container path(s)`
-      );
-      try {
-        const ciRes = await this.http.get(
-          `/api/${collection}?${buildDeepPopulateParams(allPaths, { locale, filters, extraEntries: ciEntries })}`
-        );
-        const ciData = ciRes.data?.data;
-        const ciEntry = Array.isArray(ciData) ? ciData[0] : ciData;
-        if (ciEntry) {
-          entry = this._mergeResponses(entry, ciEntry);
-        }
-      } catch (err) {
-        console.warn(
-          `[Strapi] ${collection} CI populate skipped (${err.response?.status ?? err.message})`
-        );
-      }
-    }
-
-    return entry;
+    return { entry, meta };
   }
 
   /**
-   * Fetch a single component instance by documentId with full data.
+   * Fetch any Strapi collection entry with the full nested tree, exposing
+   * component entities at every nesting level — for any unknown schema depth
+   * or field names.
    *
-   * Strategy using the Strapi Fragment API to work around the polymorphic
-   * restriction on dynamic zones:
+   * @param {string} collection  - Strapi collection plural name (e.g. 'pages', 'articles')
+   * @param {object} opts
+   * @param {object} [opts.filters]  - Strapi filter fields (e.g. { slug: '/my-page/' })
+   * @param {string} [opts.locale]   - Locale code (default: 'en')
    *
-   * Pass 1 — `populate[components][populate]=*`
-   *   Gets all embedded component data plus shallow data for relation fields.
+   * Three-phase strategy:
    *
-   * Iterative Fragment deepening —
-   *   Uses collectDeepPaths to find ALL arrays of real objects within each
-   *   component type. Builds Fragment API populates for the leaf paths.
-   *   Repeats until no new paths appear — handles any nesting depth.
-   *   Uses _mergeResponses to preserve data across passes.
+   * Phase 1 — Broad populate:
+   *   `populate=*` fetches all top-level relations one level deep.
+   *   No hardcoded field names — works for any schema.
    *
-   * Fragment CI populate —
-   *   Finds all non-dynamic-zone containers and adds explicit
-   *   component_instance populate to surface CI stubs.
+   * Phase 2 — Iterative stub deepening:
+   *   Scans for stub objects (id/documentId only, no content) and re-fetches
+   *   with deeper populate params. Merges responses to preserve breadth.
+   *   Repeats until no new stubs are found.
    *
-   * The PageResolver's recursive resolver then batch-fetches all CI stubs.
+   * Component entities are detected by value shape, not by field names.
+   */
+  async fetchEntry(collection, opts = {}) {
+    const { entry } = await this._fetchEntryEnvelope(collection, opts);
+    return entry;
+  }
+
+  async fetchEntryWithMeta(collection, opts = {}) {
+    return this._fetchEntryEnvelope(collection, opts);
+  }
+
+  /**
+   * Fetch a single nested component entity by documentId with full data.
+   *
+   * Three-phase strategy:
+   *
+   * Phase 1 — Broad populate (`populate=*`):
+   *   Gets ALL root-level relation fields populated one level deep.
+   *   This covers fields OUTSIDE the dynamic zone (e.g. settings, metadata).
+   *
+   * Phase 2 — Zone populate + Fragment API deepening:
+   *   `populate[<componentZoneField>][populate]=*` populates the dynamic zone
+   *   one level deeper. Fragment API entries (`[on][uid][populate]...`) then
+   *   iteratively deepen within each component type until convergence.
+   *
+   * Phase 3 — Non-zone iterative deepening:
+   *   Scans the ENTIRE entity for remaining stubs/deep paths outside the
+   *   dynamic zone. Deepens those via regular populate params. This handles
+   *   relations to ANY collection at ANY level — no collection names needed.
    */
   async fetchComponentInstance(documentId, locale = 'en') {
-    const baseEntries = [
-      ['locale', locale],
-      ['populate[components][populate]', '*'],
-    ];
+    const ciUrl = `/api/${this.componentCollection}/${documentId}`;
 
-    // ── Pass 1: Shallow populate ──────────────────────────────────────────
-    const res1 = await this.http.get(
-      `/api/component-instances/${documentId}?${new URLSearchParams(baseEntries)}`
+    // ── Phase 1: Broad populate ───────────────────────────────────────────
+    const broadRes = await this.http.get(
+      `${ciUrl}?${new URLSearchParams([
+        ['locale', locale],
+        ['populate', '*'],
+        this._buildLocalizationPopulateEntry(),
+      ])}`
     );
-    let data = res1.data?.data;
+    let data = broadRes.data?.data;
     if (!data) return null;
 
-    // ── Iterative Fragment deepening ──────────────────────────────────────
-    // Each pass deepens one more level of the component tree via the
-    // Fragment API. Detects both stubs AND real objects within each
-    // component type. Repeats until no new populate keys are discovered.
-    let lastFragEntries = [];
+    // ── Phase 2: Zone populate + Fragment API deepening ───────────────────
+    const zonePopulateKey = `populate[${this.schema.componentZoneField}][populate]`;
+    const zoneEntries = [
+      ['locale', locale],
+      [zonePopulateKey, '*'],
+      this._buildLocalizationPopulateEntry(),
+    ];
+
+    const zoneRes = await this.http.get(
+      `${ciUrl}?${new URLSearchParams(zoneEntries)}`
+    );
+    if (zoneRes.data?.data) data = this._mergeResponses(data, zoneRes.data.data);
+
+    // Fragment API iterative deepening within the dynamic zone
     let allFragKeys = new Set();
     for (let pass = 2; pass <= this.maxPopulatePasses; pass++) {
-      const fragEntries = buildFragmentDeepPathEntries(data.components, CI_STOP_FIELDS);
+      const fragEntries = buildFragmentDeepPathEntries(
+        data[this.schema.componentZoneField],
+        this.schema
+      );
 
       const newEntries = fragEntries.filter(([k]) => !allFragKeys.has(k));
       if (newEntries.length === 0) break;
 
       for (const [k] of fragEntries) allFragKeys.add(k);
-      lastFragEntries = fragEntries;
 
       console.log(
         `[Strapi] Component ${documentId}: fragment pass ${pass} — ${newEntries.length} new path(s)`
       );
       const res = await this.http.get(
-        `/api/component-instances/${documentId}?${new URLSearchParams([...baseEntries, ...fragEntries])}`
+        `${ciUrl}?${new URLSearchParams([...zoneEntries, ...fragEntries])}`
       );
       const newData = res.data?.data;
       if (newData) data = this._mergeResponses(data, newData);
     }
 
-    // ── Fragment CI populate for containers ───────────────────────────────
-    const ciEntries = buildFragmentCIEntries(data.components, CI_STOP_FIELDS);
-    if (ciEntries.length > 0) {
+    // ── Phase 3: Non-zone iterative deepening ─────────────────────────────
+    // Catches any remaining stubs or deep paths across the entire entity,
+    // including fields outside the dynamic zone. Uses stopAtEntities: false
+    // so populate params traverse through relations to any collection.
+    let nonZonePaths = [];
+    for (let pass = 0; pass <= this.maxPopulatePasses; pass++) {
+      const stubPaths = collectStubPaths(data, { schema: this.schema, stopAtEntities: false });
+      const deepPaths = collectDeepPaths(data, { schema: this.schema, stopAtEntities: false });
+      const combined = uniquePaths([...stubPaths, ...deepPaths]);
+
+      const prevKeys = new Set(nonZonePaths.map((p) => p.join('\0')));
+      const newPaths = combined.filter((p) => !prevKeys.has(p.join('\0')));
+      if (newPaths.length === 0) break;
+
+      nonZonePaths = uniquePaths([...nonZonePaths, ...combined]);
       console.log(
-        `[Strapi] Component ${documentId}: fragment CI populate at ${ciEntries.length / 2} container(s)`
+        `[Strapi] Component ${documentId}: non-zone pass ${pass + 1} — ${newPaths.length} new path(s)`
       );
-      // Remove fragment entries whose key is a strict parent of any CI entry.
-      const safeFragEntries = lastFragEntries.filter(
-        ([dk]) => !ciEntries.some(([ck]) => ck.startsWith(dk + '['))
+
+      const deepRes = await this.http.get(
+        `${ciUrl}?${buildDeepPopulateParams(nonZonePaths, { locale })}`
       );
-      try {
-        const res = await this.http.get(
-          `/api/component-instances/${documentId}?${new URLSearchParams([...baseEntries, ...safeFragEntries, ...ciEntries])}`
-        );
-        const ciData = res.data?.data;
-        if (ciData) {
-          data = this._mergeResponses(data, ciData);
-        }
-      } catch (err) {
-        console.warn(
-          `[Strapi] Component ${documentId}: CI populate skipped (${err.response?.status ?? err.message})`
-        );
-      }
+      const newData = deepRes.data?.data;
+      if (!newData) break;
+      data = this._mergeResponses(data, newData);
     }
 
     return data;

@@ -10,23 +10,35 @@
  * Problem B — absent relations (fields that are MISSING from the response):
  *   Strapi completely omits unpopulated relation fields — there is nothing
  *   to detect via stub scanning.
- *   Fix: after the layout tree is fully visible, find every "container array"
- *   (array of real objects) and explicitly add [field][fields][0]=documentId
- *   populate for any known relation field names (e.g. component_instance).
+ *   Fix: deepen generic object/array paths one level at a time. Once a
+ *   relation becomes visible, stop traversing it by value-shape rather than
+ *   by hardcoded field name, and let PageResolver handle it separately.
  */
 
 'use strict';
 
-const SYSTEM_KEYS = new Set([
-  'id',
-  'documentId',
-  'createdAt',
-  'updatedAt',
-  'publishedAt',
-  'locale',
-  '__component',
-  'localizations',
-]);
+function normalizeSchema(schema = {}) {
+  return {
+    entityLabelField: schema.entityLabelField || 'component_title',
+    localizationField: schema.localizationField || 'localizations',
+    componentTypeField: schema.componentTypeField || '__component',
+    componentZoneField: schema.componentZoneField || 'components',
+  };
+}
+
+function getSystemKeys(schema = {}) {
+  const normalized = normalizeSchema(schema);
+  return new Set([
+    'id',
+    'documentId',
+    'createdAt',
+    'updatedAt',
+    'publishedAt',
+    'locale',
+    normalized.componentTypeField,
+    normalized.localizationField,
+  ]);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stub detection (Problem A)
@@ -36,11 +48,49 @@ const SYSTEM_KEYS = new Set([
  * Returns true if `obj` is an unpopulated Strapi entity stub.
  * A stub has identity fields (id/documentId) but no content fields.
  */
-function isStub(obj) {
+function isStub(obj, schema = {}) {
+  const systemKeys = getSystemKeys(schema);
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
   if (!obj.documentId && !obj.id) return false;
-  const contentKeys = Object.keys(obj).filter((k) => !SYSTEM_KEYS.has(k));
+  const contentKeys = Object.keys(obj).filter((k) => !systemKeys.has(k));
   return contentKeys.length === 0;
+}
+
+function isCIEntity(obj, schema = {}) {
+  const normalized = normalizeSchema(schema);
+  return (
+    obj != null &&
+    typeof obj === 'object' &&
+    !Array.isArray(obj) &&
+    typeof obj.documentId === 'string' &&
+    normalized.entityLabelField in obj
+  );
+}
+
+function shouldStopAtValue(value, schema = {}) {
+  if (!value || typeof value !== 'object') return false;
+  if (isCIEntity(value, schema)) return true;
+  if (!Array.isArray(value)) return false;
+
+  const objects = value.filter((item) => item && typeof item === 'object');
+  return objects.length > 0 && objects.every((item) => isCIEntity(item, schema));
+}
+
+/**
+ * Returns true if `value` is a polymorphic dynamic zone — an array whose
+ * items carry `componentTypeField` (default `__component`).
+ *
+ * Strapi rejects specific-field populate params that go INSIDE a dynamic
+ * zone (e.g. `populate[components][populate][nav_links]`). Only `=*` or
+ * the Fragment API (`[on][uid][populate]...`) can be used. Scanners must
+ * stop at dynamic zones so the Fragment API handles them instead.
+ */
+function isDynamicZone(value, schema = {}) {
+  if (!Array.isArray(value)) return false;
+  const normalized = normalizeSchema(schema);
+  return value.some(
+    (item) => item && typeof item === 'object' && normalized.componentTypeField in item
+  );
 }
 
 /**
@@ -48,14 +98,15 @@ function isStub(obj) {
  *
  * @param {*}      data
  * @param {object} opts
- * @param {string[]}     [opts.segments]     - current path (internal)
- * @param {WeakSet}      [opts.visited]      - cycle guard (internal)
- * @param {Set<string>}  [opts.stopAtFields] - skip these field names entirely
+ * @param {string[]}     [opts.segments]        - current path (internal)
+ * @param {WeakSet}      [opts.visited]         - cycle guard (internal)
+ * @param {boolean}      [opts.stopAtEntities]  - when true, stop at CI entities
+ *        (default true — used by Fragment API context; pass false for page-level
+ *        scanning so populate params traverse through all relations regardless
+ *        of which collection they belong to)
  */
-function collectStubPaths(
-  data,
-  { segments = [], visited = new WeakSet(), stopAtFields = new Set() } = {}
-) {
+function collectStubPaths(data, { segments = [], visited = new WeakSet(), schema = {}, stopAtEntities = true } = {}) {
+  const systemKeys = getSystemKeys(schema);
   if (!data || typeof data !== 'object') return [];
   if (visited.has(data)) return [];
   visited.add(data);
@@ -64,33 +115,31 @@ function collectStubPaths(
 
   if (Array.isArray(data)) {
     for (const item of data) {
-      paths.push(...collectStubPaths(item, { segments, visited, stopAtFields }));
+      paths.push(...collectStubPaths(item, { segments, visited, schema, stopAtEntities }));
     }
     return paths;
   }
 
   for (const [key, value] of Object.entries(data)) {
-    if (SYSTEM_KEYS.has(key) || value === null || value === undefined) continue;
-    if (stopAtFields.has(key)) continue;
+    if (systemKeys.has(key) || value === null || value === undefined) continue;
+    // Always stop at dynamic zones — Strapi requires Fragment API for those
+    if (isDynamicZone(value, schema)) continue;
+    if (stopAtEntities && shouldStopAtValue(value, schema)) continue;
 
     const nextSegments = [...segments, key];
 
     if (Array.isArray(value)) {
       const items = value.filter(Boolean);
-      if (items.length > 0 && items.every(isStub)) {
+      if (items.length > 0 && items.every((item) => isStub(item, schema))) {
         paths.push(nextSegments);
       } else {
-        paths.push(
-          ...collectStubPaths(value, { segments: nextSegments, visited, stopAtFields })
-        );
+        paths.push(...collectStubPaths(value, { segments: nextSegments, visited, schema, stopAtEntities }));
       }
     } else if (typeof value === 'object') {
-      if (isStub(value)) {
+      if (isStub(value, schema)) {
         paths.push(nextSegments);
       } else {
-        paths.push(
-          ...collectStubPaths(value, { segments: nextSegments, visited, stopAtFields })
-        );
+        paths.push(...collectStubPaths(value, { segments: nextSegments, visited, schema, stopAtEntities }));
       }
     }
   }
@@ -111,11 +160,13 @@ function collectStubPaths(
  * fully-populated objects that could still have missing nested relations.
  * Used in the iterative deepening loop to proactively reveal tree structure
  * one level at a time.
+ *
+ * @param {boolean} [opts.stopAtEntities] - when true, stop at CI entities
+ *        (default true — Fragment API context; pass false for page-level
+ *        scanning so populate params traverse through all relations)
  */
-function collectDeepPaths(
-  data,
-  { segments = [], visited = new WeakSet(), stopAtFields = new Set() } = {}
-) {
+function collectDeepPaths(data, { segments = [], visited = new WeakSet(), schema = {}, stopAtEntities = true } = {}) {
+  const systemKeys = getSystemKeys(schema);
   if (!data || typeof data !== 'object') return [];
   if (visited.has(data)) return [];
   visited.add(data);
@@ -124,32 +175,34 @@ function collectDeepPaths(
 
   if (Array.isArray(data)) {
     for (const item of data) {
-      paths.push(...collectDeepPaths(item, { segments, visited, stopAtFields }));
+      paths.push(...collectDeepPaths(item, { segments, visited, schema, stopAtEntities }));
     }
     return paths;
   }
 
   for (const [key, value] of Object.entries(data)) {
-    if (SYSTEM_KEYS.has(key) || value == null) continue;
-    if (stopAtFields.has(key)) continue;
+    if (systemKeys.has(key) || value == null) continue;
+    // Always stop at dynamic zones — Strapi requires Fragment API for those
+    if (isDynamicZone(value, schema)) continue;
+    if (stopAtEntities && shouldStopAtValue(value, schema)) continue;
 
     const nextSegments = [...segments, key];
 
     if (Array.isArray(value)) {
       const realObjs = value.filter(
-        (v) => v && typeof v === 'object' && !Array.isArray(v) && !isStub(v)
+        (v) => v && typeof v === 'object' && !Array.isArray(v) && !isStub(v, schema)
       );
       if (realObjs.length > 0) {
         paths.push(nextSegments);
         // Recurse into items to find deeper real-object arrays
         for (const item of realObjs) {
-          paths.push(...collectDeepPaths(item, { segments: nextSegments, visited, stopAtFields }));
+          paths.push(...collectDeepPaths(item, { segments: nextSegments, visited, schema, stopAtEntities }));
         }
       }
-    } else if (typeof value === 'object' && !isStub(value)) {
+    } else if (typeof value === 'object' && !isStub(value, schema)) {
       // Single real object — deepen it and recurse to find deeper arrays within it
       paths.push(nextSegments);
-      paths.push(...collectDeepPaths(value, { segments: nextSegments, visited, stopAtFields }));
+      paths.push(...collectDeepPaths(value, { segments: nextSegments, visited, schema, stopAtEntities }));
     }
   }
 
@@ -157,115 +210,6 @@ function collectDeepPaths(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Absent relation detection (Problem B)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Walk the data tree and collect paths to every "leaf container" array.
- *
- * A leaf container is an array of real (non-stub) objects whose items do NOT
- * themselves contain further nested arrays of real objects. This targets the
- * level where component_instance lives (e.g. columns) rather than the parent
- * dynamic-zone level (e.g. layout whose items have a columns sub-array).
- *
- * Why leaf-only: layout items → have columns array → not a leaf → skip.
- *               columns items → no sub-arrays → leaf → add CI populate. ✓
- * This avoids "Invalid key component_instance at layout" 400 errors while
- * still correctly finding the actual containers that need CI populate.
- *
- * @param {*}      data
- * @param {object} opts
- * @param {string[]}    [opts.segments]     - current path (internal)
- * @param {WeakSet}     [opts.visited]      - cycle guard (internal)
- * @param {Set<string>} [opts.stopAtFields] - don't recurse into these fields
- */
-function collectContainerPaths(
-  data,
-  { segments = [], visited = new WeakSet(), stopAtFields = new Set() } = {}
-) {
-  if (!data || typeof data !== 'object') return [];
-  if (visited.has(data)) return [];
-  visited.add(data);
-
-  const paths = [];
-
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      paths.push(...collectContainerPaths(item, { segments, visited, stopAtFields }));
-    }
-    return paths;
-  }
-
-  for (const [key, value] of Object.entries(data)) {
-    if (SYSTEM_KEYS.has(key)) continue;
-    if (stopAtFields.has(key)) continue;
-    if (!value) continue;
-
-    const nextSegments = [...segments, key];
-
-    if (Array.isArray(value)) {
-      const realObjs = value.filter(
-        (v) => v && typeof v === 'object' && !Array.isArray(v) && !isStub(v)
-      );
-      if (realObjs.length > 0) {
-        // Dynamic zones (items have __component) cannot be targeted with
-        // direct field populates like component_instance — Strapi rejects
-        // them with "Invalid key … at <field>". Skip them as CI containers.
-        // The Fragment API handles CI populate inside dynamic zones instead
-        // (see fetchComponentInstance).
-        const isDynamicZone = realObjs.some((v) => '__component' in v);
-
-        if (!isDynamicZone) {
-          paths.push(nextSegments);
-        }
-      }
-      // Always recurse to find deeper containers.
-      paths.push(
-        ...collectContainerPaths(value, { segments: nextSegments, visited, stopAtFields })
-      );
-    } else if (typeof value === 'object' && !isStub(value)) {
-      paths.push(
-        ...collectContainerPaths(value, { segments: nextSegments, visited, stopAtFields })
-      );
-    }
-  }
-
-  return paths;
-}
-
-/**
- * For each container path, build URLSearchParams entries that will fetch
- * a known relation field (e.g. component_instance) with only its documentId.
- *
- * Generates:
- *   populate[…container…][populate][ciField][fields][0]=documentId
- *   populate[…container…][populate][ciField][fields][1]=component_title
- *
- * Both fields are requested so the resolver can identify CI entities by shape
- * (documentId + component_title) regardless of the field name used.
- *
- * @param {string[][]} containerPaths  - output of collectContainerPaths()
- * @param {string}     ciField         - relation field name to fetch (default: 'component_instance')
- * @returns {Array<[string, string]>}  - [key, value] pairs ready for URLSearchParams.set()
- */
-function buildCIPopulateEntries(containerPaths, ciField = 'component_instance') {
-  const entries = [];
-  const seen = new Set();
-
-  for (const segments of containerPaths) {
-    const base = segmentsToPopulateKey(segments);
-    const key0 = `${base}[${ciField}][fields][0]`;
-
-    if (!seen.has(key0)) {
-      seen.add(key0);
-      entries.push([key0, 'documentId']);
-      entries.push([`${base}[${ciField}][fields][1]`, 'component_title']);
-    }
-  }
-
-  return entries;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Populate param builders
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,22 +303,23 @@ function leafPaths(paths) {
 /**
  * Walk a `components[]` array and find ALL paths that need deeper population:
  * both arrays/objects of real data (collectDeepPaths) AND under-populated
- * stubs (collectStubPaths). Build Fragment API populate entries for the
- * leaf paths so the next fetch reveals one more level of data.
+ * stubs (collectStubPaths). Stop once a value looks like a component entity;
+ * PageResolver resolves those separately.
  *
  * Output example:
  *   ['populate[components][on][components.composition-wrapper][populate][layout][populate]', '*']
  */
-function buildFragmentDeepPathEntries(components, stopAtFields = new Set()) {
+function buildFragmentDeepPathEntries(items, schema = {}) {
+  const normalized = normalizeSchema(schema);
   const entries = [];
   const seen = new Set();
 
-  for (const comp of components || []) {
-    if (!comp || !comp.__component) continue;
-    const uid = comp.__component;
+  for (const comp of items || []) {
+    if (!comp || !comp[normalized.componentTypeField]) continue;
+    const uid = comp[normalized.componentTypeField];
 
-    const deepPaths = collectDeepPaths(comp, { stopAtFields });
-    const stubPaths = collectStubPaths(comp, { stopAtFields });
+    const deepPaths = collectDeepPaths(comp, { schema: normalized });
+    const stubPaths = collectStubPaths(comp, { schema: normalized });
     const allPaths = uniquePaths([...deepPaths, ...stubPaths]);
     const leaves = leafPaths(allPaths);
 
@@ -391,55 +336,14 @@ function buildFragmentDeepPathEntries(components, stopAtFields = new Set()) {
   return entries;
 }
 
-/**
- * Walk a `components[]` array (after deeper populate), find all container
- * arrays within each component type's data, and generate Fragment CI populate
- * entries to surface component_instance stubs at every level.
- *
- * Output example:
- *   ['populate[components][on][components.composition-wrapper][populate][layout][populate][columns][populate][component_instance][fields][0]', 'documentId']
- *
- * @param {Array}       components    - data.components from a component-instance response
- * @param {Set<string>} stopAtFields  - field names to stop scanning at (e.g. CI_STOP_FIELDS)
- * @param {string}      ciField       - relation field name (default: 'component_instance')
- */
-function buildFragmentCIEntries(
-  components,
-  stopAtFields = new Set(),
-  ciField = 'component_instance'
-) {
-  const entries = [];
-  const seen = new Set();
-
-  for (const comp of components || []) {
-    if (!comp || !comp.__component) continue;
-    const uid = comp.__component;
-
-    const containerPaths = collectContainerPaths(comp, { stopAtFields });
-    for (const segments of containerPaths) {
-      const innerPath = segments.join('][populate][');
-      const key0 = `populate[components][on][${uid}][populate][${innerPath}][populate][${ciField}][fields][0]`;
-      if (!seen.has(key0)) {
-        seen.add(key0);
-        entries.push([key0, 'documentId']);
-        entries.push([
-          `populate[components][on][${uid}][populate][${innerPath}][populate][${ciField}][fields][1]`,
-          'component_title',
-        ]);
-      }
-    }
-  }
-
-  return entries;
-}
-
 module.exports = {
   collectStubPaths,
   collectDeepPaths,
-  collectContainerPaths,
   uniquePaths,
-  buildCIPopulateEntries,
   buildDeepPopulateParams,
   buildFragmentDeepPathEntries,
-  buildFragmentCIEntries,
+  isCIEntity,
+  isDynamicZone,
+  shouldStopAtValue,
+  normalizeSchema,
 };

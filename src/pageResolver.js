@@ -3,9 +3,9 @@
  *
  * Strategy:
  * 1. Fetch the page shell — layout tree iteratively deepened until
- *    component_instance stubs are visible at every level.
- * 2. Recursively resolve ALL component-instance entities in the tree:
- *    - Detect them by shape (documentId + component_title), not field name
+ *    component entities are visible at every level.
+ * 2. Recursively resolve all component entities in the tree:
+ *    - Detect them by shape, not relation field name
  *    - Batch-fetch them in parallel
  *    - Recursively resolve entities inside each fetched instance
  *    - Repeat until no new entities remain (handles any nesting depth)
@@ -15,14 +15,41 @@
  * handles circular references safely.
  */
 
-// Keys that should never be treated as CI containers or recursed into
-// for CI detection. localizations items share the same shape as CIs
-// (they have documentId + component_title) but are NOT CIs.
-const SKIP_KEYS = new Set(['localizations']);
-
 class PageResolver {
-  constructor(strapiClient) {
+  constructor(strapiClient, config = {}) {
     this.strapi = strapiClient;
+    this.schema = {
+      entityLabelField:
+        config.entityLabelField ||
+        strapiClient?.schema?.entityLabelField ||
+        'component_title',
+      localizationField:
+        config.localizationField ||
+        strapiClient?.schema?.localizationField ||
+        'localizations',
+    };
+  }
+
+  _defaultMeta(hasEntry = true) {
+    return {
+      pagination: {
+        page: 1,
+        pageCount: hasEntry ? 1 : 0,
+        pageSize: hasEntry ? 1 : 0,
+        total: hasEntry ? 1 : 0,
+      },
+    };
+  }
+
+  async _resolveEntry(entry, collection, locale, startTime) {
+    // cache: documentId → fully resolved instance data (null = fetch failed)
+    const cache = {};
+    const resolved = await this._deepResolve(entry, locale, cache);
+
+    console.log(
+      `[Resolver] Done — ${Object.keys(cache).length} component instance(s) resolved in ${Date.now() - startTime}ms`
+    );
+    return resolved;
   }
 
   /**
@@ -37,15 +64,23 @@ class PageResolver {
 
     const entry = await this.strapi.fetchEntry(collection, { filters, locale });
     console.log(`[Resolver] ${collection} entry fetched in ${Date.now() - startTime}ms`);
+    return this._resolveEntry(entry, collection, locale, startTime);
+  }
 
-    // cache: documentId → fully resolved instance data (null = fetch failed)
-    const cache = {};
-    const resolved = await this._deepResolve(entry, locale, cache);
+  async resolveWithMeta(collection, filters = {}, locale = 'en') {
+    const startTime = Date.now();
 
-    console.log(
-      `[Resolver] Done — ${Object.keys(cache).length} component instance(s) resolved in ${Date.now() - startTime}ms`
-    );
-    return resolved;
+    const { entry, meta } = await this.strapi.fetchEntryWithMeta(collection, {
+      filters,
+      locale,
+    });
+    console.log(`[Resolver] ${collection} entry fetched in ${Date.now() - startTime}ms`);
+
+    const resolved = await this._resolveEntry(entry, collection, locale, startTime);
+    return {
+      data: [resolved],
+      meta: meta ?? this._defaultMeta(true),
+    };
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -53,9 +88,8 @@ class PageResolver {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Returns true if `obj` looks like a component-instance entity.
-   * Detection is shape-based (documentId + component_title), not key-based,
-   * so it works regardless of the relation field name used in Strapi.
+   * Returns true if `obj` looks like a resolvable component entity.
+   * Detection is shape-based using configurable schema hints, not key-based.
    */
   _isCIEntity(obj) {
     return (
@@ -63,12 +97,12 @@ class PageResolver {
       typeof obj === 'object' &&
       !Array.isArray(obj) &&
       typeof obj.documentId === 'string' &&
-      'component_title' in obj
+      this.schema.entityLabelField in obj
     );
   }
 
   /**
-   * Recursively resolve all component-instance entities in `data`.
+   * Recursively resolve all component entities in `data`.
    * Fetches in waves: collect all new entities → batch-fetch → recurse into
    * each fetched instance → replace. Repeats until no new entities are found.
    */
@@ -104,8 +138,8 @@ class PageResolver {
   }
 
   /**
-   * Walk the tree and collect every component-instance entity.
-   * Detects by shape (documentId + component_title) — works for any field name.
+   * Walk the tree and collect every resolvable component entity.
+   * Detects by shape using configurable schema hints — works for any field name.
    * Does not recurse into found entities — the resolver re-fetches them fully.
    */
   _findAllCIStubs(data, visited = new WeakSet()) {
@@ -128,7 +162,7 @@ class PageResolver {
 
     for (const [key, value] of Object.entries(data)) {
       if (!value || typeof value !== 'object') continue;
-      if (SKIP_KEYS.has(key)) continue;
+      if (key === this.schema.localizationField) continue;
 
       if (this._isCIEntity(value)) {
         stubs.push(value);
@@ -149,9 +183,9 @@ class PageResolver {
   }
 
   /**
-   * Walk the tree and replace every component-instance entity with the
+   * Walk the tree and replace every resolved component entity with the
    * resolved data from cache. Falls back to the original on failure.
-   * Detection is shape-based — works for any field name.
+   * Detection is shape-based using configurable schema hints.
    */
   _replaceCIStubs(data, cache, visited = new WeakSet()) {
     if (!data || typeof data !== 'object') return data;
@@ -178,7 +212,7 @@ class PageResolver {
         continue;
       }
 
-      if (SKIP_KEYS.has(key)) {
+      if (key === this.schema.localizationField) {
         result[key] = value;
         continue;
       }

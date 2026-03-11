@@ -139,6 +139,17 @@ const RESOLVED_EXPECTED = buildExpected(PAGE_SHELL, CI_MAP);
 function createMockClient() {
   return {
     fetchEntry: jest.fn().mockResolvedValue(JSON.parse(JSON.stringify(PAGE_SHELL))),
+    fetchEntryWithMeta: jest.fn().mockResolvedValue({
+      entry: JSON.parse(JSON.stringify(PAGE_SHELL)),
+      meta: {
+        pagination: {
+          page: 1,
+          pageCount: 1,
+          pageSize: 25,
+          total: 1,
+        },
+      },
+    }),
     fetchComponentInstancesBatch: jest.fn().mockImplementation((docIds) => {
       const result = {};
       for (const id of docIds) {
@@ -182,6 +193,34 @@ describe('PageResolver', () => {
     expect(mockClient.fetchEntry).toHaveBeenCalledWith('articles', {
       filters: { category: 'tech' },
       locale: 'en',
+    });
+  });
+
+  test('resolve() uses default filters and locale when omitted', async () => {
+    await resolver.resolve('pages');
+    expect(mockClient.fetchEntry).toHaveBeenCalledWith('pages', {
+      filters: {},
+      locale: 'en',
+    });
+  });
+
+  test('resolveWithMeta() returns Strapi-like response envelope', async () => {
+    const result = await resolver.resolveWithMeta('pages', { slug: '/dynamic/{{dynamic}}/' }, 'en');
+
+    expect(mockClient.fetchEntryWithMeta).toHaveBeenCalledWith('pages', {
+      filters: { slug: '/dynamic/{{dynamic}}/' },
+      locale: 'en',
+    });
+    expect(result).toEqual({
+      data: [RESOLVED_EXPECTED],
+      meta: {
+        pagination: {
+          page: 1,
+          pageCount: 1,
+          pageSize: 25,
+          total: 1,
+        },
+      },
     });
   });
 
@@ -325,6 +364,103 @@ describe('PageResolver', () => {
     );
   });
 
+  test('finds stubs in root arrays and returns early for null or visited data', () => {
+    const seen = { component_instance: { id: 1, documentId: 'seen', component_title: 'Seen' } };
+    const visited = new WeakSet([seen]);
+
+    expect(resolver._findAllCIStubs(null)).toEqual([]);
+    expect(resolver._findAllCIStubs(seen, visited)).toEqual([]);
+
+    const data = [
+      { id: 10, documentId: 'root-ci', component_title: 'Root CI' },
+      {
+        nested_items: [
+          { id: 11, documentId: 'nested-ci', component_title: 'Nested CI' },
+          42,
+          {
+            deep: {
+              id: 12,
+              documentId: 'deep-ci',
+              component_title: 'Deep CI',
+            },
+          },
+        ],
+      },
+    ];
+
+    const stubs = resolver._findAllCIStubs(data);
+
+    expect(stubs.map((stub) => stub.documentId)).toEqual([
+      'root-ci',
+      'nested-ci',
+      'deep-ci',
+    ]);
+  });
+
+  test('replaces stubs in root arrays and preserves unresolved array items', () => {
+    const seen = { any: 'value' };
+    const visited = new WeakSet([seen]);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(resolver._replaceCIStubs(null, {})).toBeNull();
+    expect(resolver._replaceCIStubs(seen, {}, visited)).toBe(seen);
+
+    const rootResolvedStub = {
+      id: 20,
+      documentId: 'root-resolved',
+      component_title: 'Root Resolved',
+    };
+    const rootMissingStub = {
+      id: 21,
+      documentId: 'root-missing',
+      component_title: 'Root Missing',
+    };
+    const nestedMissingStub = {
+      id: 22,
+      documentId: 'nested-missing',
+      component_title: 'Nested Missing',
+    };
+    const resolvedPayload = {
+      id: 20,
+      documentId: 'root-resolved',
+      component_title: 'Root Resolved',
+      components: [{ label: 'resolved' }],
+    };
+
+    const result = resolver._replaceCIStubs(
+      [
+        rootResolvedStub,
+        rootMissingStub,
+        {
+          nested_items: [
+            nestedMissingStub,
+            {
+              child: rootResolvedStub,
+            },
+          ],
+        },
+      ],
+      {
+        'root-resolved': resolvedPayload,
+        'root-missing': null,
+        'nested-missing': null,
+      }
+    );
+
+    expect(result[0]).toEqual(resolvedPayload);
+    expect(result[1]).toBe(rootMissingStub);
+    expect(result[2].nested_items[0]).toBe(nestedMissingStub);
+    expect(result[2].nested_items[1].child).toEqual(resolvedPayload);
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[Resolver] Missing data for component: root-missing'
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[Resolver] Missing data for component: nested-missing'
+    );
+
+    warnSpy.mockRestore();
+  });
+
   test('skips localizations even though they have component_title', () => {
     const data = {
       component_instance: {
@@ -339,5 +475,37 @@ describe('PageResolver', () => {
     const stubs = resolver._findAllCIStubs(data);
     expect(stubs).toHaveLength(1);
     expect(stubs[0].documentId).toBe('real-ci');
+  });
+
+  test('supports configurable entity and localization field names', () => {
+    const customResolver = new PageResolver(
+      {
+        entityLabelField: 'title_field',
+        localizationField: 'translations',
+      },
+      {
+        entityLabelField: 'title_field',
+        localizationField: 'translations',
+      }
+    );
+    const data = {
+      relation_a: {
+        id: 1,
+        documentId: 'custom-ci',
+        title_field: 'Custom CI',
+      },
+      translations: [
+        {
+          id: 2,
+          documentId: 'custom-ci',
+          title_field: 'Localized variant',
+          locale: 'hi',
+        },
+      ],
+    };
+
+    const stubs = customResolver._findAllCIStubs(data);
+    expect(stubs).toHaveLength(1);
+    expect(stubs[0].documentId).toBe('custom-ci');
   });
 });
