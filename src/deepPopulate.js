@@ -219,10 +219,16 @@ function collectDeepPaths(data, { segments = [], visited = new WeakSet(), schema
         (v) => v && typeof v === 'object' && !Array.isArray(v) && !isStub(v, schema)
       );
       if (realObjs.length > 0) {
-        paths.push(nextSegments);
-        // Recurse into items to find deeper real-object arrays
-        for (const item of realObjs) {
-          paths.push(...collectDeepPaths(item, { segments: nextSegments, visited, schema, stopAtEntities }));
+        // Skip Strapi Blocks / richtext arrays — every item has a 'type' key but no
+        // 'id'. Sending populate params for these fields causes a Strapi 400
+        // ValidationError because blocks content cannot be populated.
+        const looksLikeBlocks = realObjs.every((item) => item.id == null && 'type' in item);
+        if (!looksLikeBlocks) {
+          paths.push(nextSegments);
+          // Recurse into items to find deeper real-object arrays
+          for (const item of realObjs) {
+            paths.push(...collectDeepPaths(item, { segments: nextSegments, visited, schema, stopAtEntities }));
+          }
         }
       }
     } else if (typeof value === 'object' && !isStub(value, schema)) {

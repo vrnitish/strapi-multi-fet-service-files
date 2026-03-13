@@ -609,7 +609,7 @@ describe('StrapiClient', () => {
 
   // ── fetchBatchByDocumentId error handling ────────────────────────────────
 
-  test('fetchBatchByDocumentId handles individual fetch errors gracefully', async () => {
+  test('fetchBatchByDocumentId throws if any individual fetch fails', async () => {
     client.http.get = jest.fn().mockImplementation((url) => {
       if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
       if (url.includes('ci-bad')) return Promise.reject(new Error('Network error'));
@@ -618,12 +618,9 @@ describe('StrapiClient', () => {
       });
     });
 
-    const result = await client.fetchBatchByDocumentId(
-      'component-instances', ['ci-good', 'ci-bad'], 'en'
-    );
-
-    expect(result['ci-good'].documentId).toBe('ci-good');
-    expect(result['ci-bad']).toBeNull();
+    await expect(
+      client.fetchBatchByDocumentId('component-instances', ['ci-good', 'ci-bad'], 'en')
+    ).rejects.toThrow('Partial fetch failure');
   });
 
   // ── _mergeResponses edge cases ───────────────────────────────────────────

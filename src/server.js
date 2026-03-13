@@ -9,9 +9,42 @@
  */
 
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const StrapiClient = require('./strapiClient');
 const PageResolver = require('./pageResolver');
 const CacheManager = require('./cacheManager');
+
+const LOGS_DIR = path.join(__dirname, '..', 'logs');
+
+/**
+ * Append a structured JSON entry to logs/YYYY-MM-DD.log.
+ * Each line is a self-contained JSON object (newline-delimited JSON).
+ */
+function writeErrorLog(req, context, err) {
+  try {
+    if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
+
+    const date = new Date().toISOString().slice(0, 10);
+    const logFile = path.join(LOGS_DIR, `${date}.log`);
+
+    const entry = {
+      timestamp: new Date().toISOString(),
+      url: req.originalUrl,
+      method: req.method,
+      ...context,
+      error: err.message,
+      strapiStatus: err.response?.status ?? null,
+      strapiBody: err.response?.data ?? null,
+      failures: err.failures ?? null,
+      stack: err.stack,
+    };
+
+    fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
+  } catch (logErr) {
+    console.error('[Server] Failed to write error log:', logErr.message);
+  }
+}
 
 function createServer(config) {
   const app = express();
@@ -124,10 +157,11 @@ function createServer(config) {
         err.message,
         strapiBody ? JSON.stringify(strapiBody) : ''
       );
+      writeErrorLog(req, { collection, documentId }, err);
 
       if (strapiStatus) return res.status(strapiStatus).json(strapiBody);
       if (err.message.includes('not found')) return res.status(404).json({ error: err.message });
-      return res.status(500).json({ error: err.message });
+      return res.status(500).json({ error: err.message, failures: err.failures ?? undefined });
     }
   });
 
@@ -230,10 +264,11 @@ function createServer(config) {
         err.message,
         strapiBody ? JSON.stringify(strapiBody) : ''
       );
+      writeErrorLog(req, { collection }, err);
 
       if (strapiStatus) return res.status(strapiStatus).json(strapiBody);
       if (err.message.includes('not found')) return res.status(404).json({ error: err.message });
-      return res.status(500).json({ error: err.message });
+      return res.status(500).json({ error: err.message, failures: err.failures ?? undefined });
     }
   });
 

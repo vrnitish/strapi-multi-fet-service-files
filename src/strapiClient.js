@@ -447,19 +447,34 @@ class StrapiClient {
     const fetches = documentIds.map((docId) =>
       this.fetchByDocumentId(collection, docId, locale)
         .then((data) => ({ docId, data, error: null }))
-        .catch((err) => ({ docId, data: null, error: err.message }))
+        .catch((err) => ({ docId, data: null, error: err }))
     );
 
     const results = await Promise.all(fetches);
 
+    const failures = results.filter((r) => r.error !== null);
+    if (failures.length > 0) {
+      const details = failures
+        .map((f) => `${collection}/${f.docId}: ${f.error.message}`)
+        .join('; ');
+      const combined = new Error(`Partial fetch failure — ${failures.length} entity/entities could not be fetched: ${details}`);
+      combined.failures = failures.map((f) => ({
+        collection,
+        documentId: f.docId,
+        message: f.error.message,
+        strapiStatus: f.error.response?.status,
+        strapiBody: f.error.response?.data,
+        stack: f.error.stack,
+      }));
+      // Attach first Strapi HTTP response for upstream error passthrough
+      const firstWithResponse = failures.find((f) => f.error.response);
+      if (firstWithResponse) combined.response = firstWithResponse.error.response;
+      throw combined;
+    }
+
     const map = {};
-    for (const { docId, data, error } of results) {
-      if (error) {
-        console.warn(`[Strapi] Failed to fetch ${collection}/${docId}: ${error}`);
-        map[docId] = null;
-      } else {
-        map[docId] = data;
-      }
+    for (const { docId, data } of results) {
+      map[docId] = data;
     }
     return map;
   }
