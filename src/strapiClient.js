@@ -91,57 +91,75 @@ class StrapiClient {
   // Page/entry fetch — populate=* + iterative deepening
   // ─────────────────────────────────────────────────────────────────────────
 
-  async _fetchEntryEnvelope(collection, { filters = {}, locale = 'en' } = {}) {
+  async _fetchEntryEnvelope(collection, { filters = {}, locale = 'en', maxDepth = Infinity, rawQuery = null } = {}) {
     let meta;
 
-    // Phase 1: populate=* — gets ALL fields (including null/[]) one level deep
-    const params1 = new URLSearchParams();
-    for (const [field, value] of Object.entries(filters)) {
-      params1.set(`filters[${field}][$eq]`, value);
+    // Base query: rawQuery (Strapi-native, from request — filters, sort, pagination, etc.)
+    // or built from filters+locale. Never contains populate (caller strips it).
+    let baseParams;
+    if (rawQuery != null) {
+      baseParams = new URLSearchParams(rawQuery);
+    } else {
+      baseParams = new URLSearchParams();
+      for (const [field, value] of Object.entries(filters)) {
+        baseParams.set(`filters[${field}][$eq]`, value);
+      }
+      if (locale) baseParams.set('locale', locale);
     }
-    if (locale) params1.set('locale', locale);
-    params1.set('populate', '*');
+    const baseQuery = baseParams.toString();
 
-    const firstRes = await this.http.get(`/api/${collection}?${params1}`);
+    // Phase 1: populate=* — gets ALL fields (including null/[]) one level deep
+    const p1 = new URLSearchParams(baseQuery);
+    p1.set('populate', '*');
+
+    const firstRes = await this.http.get(`/api/${collection}?${p1}`);
     const firstData = firstRes.data?.data;
     meta = firstRes.data?.meta;
 
-    let entry = Array.isArray(firstData) ? firstData[0] : firstData;
-    if (!entry) {
-      throw new Error(`No entry found in ${collection} with filters: ${JSON.stringify(filters)}`);
+    // Work with all entries — isList = true only when Strapi returns multiple
+    // entries (e.g. GET /api/pages with no narrow filter). A filtered request
+    // that matches exactly one entry still returns a single object.
+    const isList = Array.isArray(firstData) && firstData.length > 1;
+    let entries = Array.isArray(firstData)
+      ? (firstData.length > 0 ? firstData : [])
+      : (firstData ? [firstData] : []);
+    if (entries.length === 0) {
+      throw new Error(`No entry found in ${collection}: ${rawQuery ?? JSON.stringify(filters)}`);
     }
 
     // Phase 1b: explicitly fetch any always-populate fields missing from entry.
     // Strapi omits optional null fields (e.g. seo_elements: null) from populate=*
     // responses. A dedicated request with explicit populate params forces them back.
-    const missingAlways = this.alwaysPopulateFields.filter((f) => !(f in entry));
+    const missingAlways = this.alwaysPopulateFields.filter((f) => !(f in entries[0]));
     if (missingAlways.length > 0) {
-      const p1bParams = new URLSearchParams();
-      for (const [field, value] of Object.entries(filters)) {
-        p1bParams.set(`filters[${field}][$eq]`, value);
-      }
-      if (locale) p1bParams.set('locale', locale);
+      const p1bParams = new URLSearchParams(baseQuery);
       for (const f of missingAlways) p1bParams.set(`populate[${f}][populate]`, '*');
       const p1bRes = await this.http.get(`/api/${collection}?${p1bParams}`).catch(() => null);
       const p1bData = p1bRes?.data?.data;
-      const p1bEntry = Array.isArray(p1bData) ? p1bData[0] : p1bData;
-      if (p1bEntry) entry = this._mergeResponses(entry, p1bEntry);
+      if (p1bData) {
+        const p1bEntries = Array.isArray(p1bData) ? p1bData : [p1bData];
+        entries = this._mergeEntriesById(entries, p1bEntries);
+      }
     }
 
-    // Save Phase 1 localizations — deepening requests use specific populate
-    // params instead of populate=* and Strapi returns localizations: [] for
-    // those, which would overwrite the populated data via _mergeResponses.
+    // Save Phase 1 localizations per entry — deepening requests use specific
+    // populate params and Strapi returns localizations: [] for those, which
+    // would overwrite the populated data via _mergeResponses.
     const locField = this.schema.localizationField;
-    const phase1Localizations = entry[locField];
+    const phase1LocalizationsMap = new Map(
+      entries.map((e) => [e.documentId, e[locField]])
+    );
 
-    // Phase 2: Iterative deepening — deepen non-collection-key paths
-    // stopAtEntities: false — traverse through all relations to expose
-    // collection relation stubs at any depth. The resolver handles them.
+    // Phase 2: Iterative deepening — collect paths across ALL entries so a
+    // single deepening request covers the union of all their structures.
+    // maxDepth=N limits to N-1 extra passes (depth=1 means populate=* only).
+    const maxExtraPasses = Number.isFinite(maxDepth) ? maxDepth - 1 : this.maxPopulatePasses;
     let allPaths = [];
-    for (let pass = 2; pass <= this.maxPopulatePasses; pass++) {
-      const stubPaths = collectStubPaths(entry, { schema: this.schema, stopAtEntities: false });
-      const deepPaths = collectDeepPaths(entry, { schema: this.schema, stopAtEntities: false });
-      const combined = uniquePaths([...stubPaths, ...deepPaths]);
+    for (let pass = 2; pass < 2 + maxExtraPasses; pass++) {
+      const combined = uniquePaths(entries.flatMap((e) => [
+        ...collectStubPaths(e, { schema: this.schema, stopAtEntities: false }),
+        ...collectDeepPaths(e, { schema: this.schema, stopAtEntities: false }),
+      ]));
 
       const prevKeys = new Set(allPaths.map((p) => p.join('\0')));
       const newPaths = combined.filter((p) => !prevKeys.has(p.join('\0')));
@@ -151,56 +169,70 @@ class StrapiClient {
       console.log(`[Strapi] ${collection} pass ${pass}: ${newPaths.length} new path(s) — deepening`);
 
       const deepRes = await this.http.get(
-        `/api/${collection}?${buildDeepPopulateParams(allPaths, { locale, filters })}`
+        `/api/${collection}?${buildDeepPopulateParams(allPaths, { rawQuery: baseQuery })}`
       );
       const newData = deepRes.data?.data;
-      const newEntry = Array.isArray(newData) ? newData[0] : newData;
-      if (!newEntry) break;
-      entry = this._mergeResponses(entry, newEntry);
+      if (!newData) break;
+      const newEntries = Array.isArray(newData) ? newData : [newData];
+      entries = this._mergeEntriesById(entries, newEntries);
 
       // Restore localizations if a deepening pass overwrote them with []
-      if (
-        phase1Localizations &&
-        Array.isArray(phase1Localizations) &&
-        phase1Localizations.length > 0 &&
-        (!entry[locField] || (Array.isArray(entry[locField]) && entry[locField].length === 0))
-      ) {
-        entry[locField] = phase1Localizations;
-      }
+      entries = entries.map((e) => {
+        const saved = phase1LocalizationsMap.get(e.documentId);
+        if (saved && Array.isArray(saved) && saved.length > 0 &&
+            (!e[locField] || (Array.isArray(e[locField]) && e[locField].length === 0))) {
+          return { ...e, [locField]: saved };
+        }
+        return e;
+      });
     }
 
-    // Phase 3: Populate localization entries.
-    // Strapi v5 often returns localizations:[] even when localized versions
-    // exist (https://forum.strapi.io/t/v5-localizations/40283). Instead of
-    // relying on the field, we query /api/i18n/locales for the full locale
-    // list and fetch the entry in each other locale directly.
-    if (entry.documentId) {
+    // Phase 3: Populate localization entries — only for single-entry results.
+    // Skipped for list results (too many entries, localizations not typically
+    // needed for list views) and for depth-limited requests.
+    if (Number.isFinite(maxDepth)) return { entry: isList ? entries : entries[0], meta };
+    if (!isList && entries[0]?.documentId) {
       const allLocales = await this._fetchLocales();
       const otherLocales = allLocales.filter((l) => l !== locale);
 
       if (otherLocales.length > 0) {
         console.log(
-          `[Strapi] ${collection}: fetching ${otherLocales.length} locale(s) for documentId ${entry.documentId}`
+          `[Strapi] ${collection}: fetching ${otherLocales.length} locale(s) for documentId ${entries[0].documentId}`
         );
 
         const locResults = await Promise.all(
           otherLocales.map((loc) =>
-            this.fetchByDocumentId(collection, entry.documentId, loc, {
-              resolveLocalizations: false,
-            })
-              .then((d) => d || null)
+            this.http.get(
+              `/api/${collection}/${entries[0].documentId}?${new URLSearchParams([['locale', loc]])}`
+            )
+              .then((r) => r.data?.data || null)
               .catch(() => null)
           )
         );
 
-        const populated = locResults.filter(Boolean);
+        const populated = locResults.filter((r) => r && r.locale && r.locale !== locale);
         if (populated.length > 0) {
-          entry[locField] = populated;
+          entries[0][locField] = populated;
         }
       }
     }
 
-    return { entry, meta };
+    return { entry: isList ? entries : entries[0], meta };
+  }
+
+  /**
+   * Merge two arrays of entries by documentId.
+   * For each entry in `existing`, finds the matching entry in `incoming`
+   * by documentId and deep-merges it. Unmatched entries are kept as-is.
+   */
+  _mergeEntriesById(existing, incoming) {
+    const incomingMap = new Map(
+      incoming.filter((e) => e?.documentId).map((e) => [e.documentId, e])
+    );
+    return existing.map((e) => {
+      const match = e?.documentId && incomingMap.get(e.documentId);
+      return match ? this._mergeResponses(e, match) : e;
+    });
   }
 
   async fetchEntry(collection, opts = {}) {
@@ -210,6 +242,16 @@ class StrapiClient {
 
   async fetchEntryWithMeta(collection, opts = {}) {
     return this._fetchEntryEnvelope(collection, opts);
+  }
+
+  /**
+   * Proxy a GET request directly to Strapi, forwarding the query string as-is.
+   * Used when the caller provides their own populate params.
+   */
+  async proxyGet(path, queryString) {
+    const url = queryString ? `${path}?${queryString}` : path;
+    const res = await this.http.get(url);
+    return res.data;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -227,21 +269,30 @@ class StrapiClient {
    * @param {boolean} [opts.resolveLocalizations=true] - set to false to skip
    *        Phase 4 (prevents infinite recursion when fetching localization entries)
    */
-  async fetchByDocumentId(collection, documentId, locale = 'en', { resolveLocalizations = true } = {}) {
+  async fetchByDocumentId(collection, documentId, locale = 'en', { resolveLocalizations = true, rawQuery = null } = {}) {
     const url = `/api/${collection}/${documentId}`;
 
+    // Base query for every Strapi request: rawQuery from the original HTTP
+    // request (carries locale, fields, sort, etc.) or just locale when called
+    // internally (CI batch fetch, localization recursion).
+    const baseParams = rawQuery != null
+      ? new URLSearchParams(rawQuery)
+      : new URLSearchParams([['locale', locale]]);
+    const baseQuery = baseParams.toString();
+
     // ── Phase 1: populate=* ───────────────────────────────────────────────────
-    const broadRes = await this.http.get(
-      `${url}?${new URLSearchParams([['locale', locale], ['populate', '*']])}`
-    );
+    const p1 = new URLSearchParams(baseQuery);
+    p1.set('populate', '*');
+    const broadRes = await this.http.get(`${url}?${p1}`);
     let data = broadRes.data?.data;
     if (!data) return null;
 
     // ── Phase 1b: explicitly fetch any always-populate fields missing from data ──
     const missingAlwaysCI = this.alwaysPopulateFields.filter((f) => !(f in data));
     if (missingAlwaysCI.length > 0) {
-      const p1bEntries = [['locale', locale], ...missingAlwaysCI.map((f) => [`populate[${f}][populate]`, '*'])];
-      const p1bRes = await this.http.get(`${url}?${new URLSearchParams(p1bEntries)}`).catch(() => null);
+      const p1bParams = new URLSearchParams(baseQuery);
+      for (const f of missingAlwaysCI) p1bParams.set(`populate[${f}][populate]`, '*');
+      const p1bRes = await this.http.get(`${url}?${p1bParams}`).catch(() => null);
       if (p1bRes?.data?.data) data = this._mergeResponses(data, p1bRes.data.data);
     }
 
@@ -268,14 +319,11 @@ class StrapiClient {
 
     if (data[zoneField] !== undefined) {
       const zonePopulateKey = `populate[${zoneField}][populate]`;
-      const zoneEntries = [
-        ['locale', locale],
-        [zonePopulateKey, '*'],
-      ];
 
-      const zoneRes = await this.http.get(
-        `${url}?${new URLSearchParams(zoneEntries)}`
-      );
+      const zoneParams = new URLSearchParams(baseQuery);
+      zoneParams.set(zonePopulateKey, '*');
+
+      const zoneRes = await this.http.get(`${url}?${zoneParams}`);
       if (zoneRes.data?.data) {
         data = this._mergeResponses(data, zoneRes.data.data);
         _restoreLocalizations();
@@ -297,9 +345,10 @@ class StrapiClient {
         console.log(
           `[Strapi] ${collection}/${documentId}: fragment pass ${pass} — ${newEntries.length} new path(s)`
         );
-        const res = await this.http.get(
-          `${url}?${new URLSearchParams([...zoneEntries, ...fragEntries])}`
-        );
+        const fragParams = new URLSearchParams(baseQuery);
+        fragParams.set(zonePopulateKey, '*');
+        for (const [k, v] of fragEntries) fragParams.set(k, v);
+        const res = await this.http.get(`${url}?${fragParams}`);
         const newData = res.data?.data;
         if (newData) {
           data = this._mergeResponses(data, newData);
@@ -311,6 +360,22 @@ class StrapiClient {
     // ── Phase 3: Non-zone iterative deepening ─────────────────────────────
     // Catches remaining stubs or deep paths across the entire entity.
     // stopAtEntities: false so populate params traverse through all relations.
+    //
+    // Phase 3 requests do NOT include zone populate params, so Strapi returns
+    // the zone field as [] in those responses. Save zone data here and restore
+    // it after every merge — mirrors the _restoreLocalizations pattern.
+    let savedZoneData = data[zoneField];
+    const _restoreZone = () => {
+      if (
+        savedZoneData &&
+        Array.isArray(savedZoneData) &&
+        savedZoneData.length > 0 &&
+        (!data[zoneField] || (Array.isArray(data[zoneField]) && data[zoneField].length === 0))
+      ) {
+        data[zoneField] = savedZoneData;
+      }
+    };
+
     let nonZonePaths = [];
     for (let pass = 0; pass <= this.maxPopulatePasses; pass++) {
       const stubPaths = collectStubPaths(data, { schema: this.schema, stopAtEntities: false });
@@ -327,12 +392,13 @@ class StrapiClient {
       );
 
       const deepRes = await this.http.get(
-        `${url}?${buildDeepPopulateParams(nonZonePaths, { locale })}`
+        `${url}?${buildDeepPopulateParams(nonZonePaths, { rawQuery: baseQuery })}`
       );
       const newData = deepRes.data?.data;
       if (!newData) break;
       data = this._mergeResponses(data, newData);
       _restoreLocalizations();
+      _restoreZone();
     }
 
     // ── Phase 4: Populate localization entries ──────────────────────────
@@ -351,15 +417,17 @@ class StrapiClient {
 
         const locResults = await Promise.all(
           otherLocales.map((loc) =>
-            this.fetchByDocumentId(collection, documentId, loc, {
-              resolveLocalizations: false,
-            })
-              .then((d) => d || null)
+            this.http.get(
+              `${url}?${new URLSearchParams([['locale', loc]])}`
+            )
+              .then((r) => r.data?.data || null)
               .catch(() => null)
           )
         );
 
-        const populated = locResults.filter(Boolean);
+        // Only include results that have a locale field — filters out non-i18n
+        // collections (e.g. user-types) that return the same entity for every locale.
+        const populated = locResults.filter((r) => r && r.locale && r.locale !== locale);
         if (populated.length > 0) {
           data[locField] = populated;
         }

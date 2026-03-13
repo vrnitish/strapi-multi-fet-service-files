@@ -265,17 +265,20 @@ function buildDeepPopulateParams(stubPaths, opts = {}) {
   const {
     locale,
     filters = {},
+    rawQuery,
     basePopulateKey,
     basePopulateValue = '*',
     extraEntries = [],
   } = opts;
 
-  const params = new URLSearchParams();
+  const params = rawQuery != null ? new URLSearchParams(rawQuery) : new URLSearchParams();
 
-  for (const [field, value] of Object.entries(filters)) {
-    params.set(`filters[${field}][$eq]`, value);
+  if (rawQuery == null) {
+    for (const [field, value] of Object.entries(filters)) {
+      params.set(`filters[${field}][$eq]`, value);
+    }
+    if (locale) params.set('locale', locale);
   }
-  if (locale) params.set('locale', locale);
   if (basePopulateKey) params.set(basePopulateKey, basePopulateValue);
 
   for (const segments of leafPaths(stubPaths)) {

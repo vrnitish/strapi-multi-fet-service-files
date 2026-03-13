@@ -452,4 +452,420 @@ describe('StrapiClient', () => {
     // plus 1 shared/cached i18n/locales call → 2×1 + 1 = 3
     expect(client.http.get).toHaveBeenCalledTimes(3);
   });
+
+  // ── _mergeEntriesById ────────────────────────────────────────────────────
+
+  test('_mergeEntriesById merges matching entries by documentId', () => {
+    const existing = [
+      { documentId: 'a', title: 'Old A', extra: 'keep' },
+      { documentId: 'b', title: 'Old B' },
+    ];
+    const incoming = [
+      { documentId: 'a', title: 'New A', newField: 'added' },
+      { documentId: 'c', title: 'C (not in existing)' },
+    ];
+    const result = client._mergeEntriesById(existing, incoming);
+    expect(result[0].title).toBe('New A');
+    expect(result[0].extra).toBe('keep');
+    expect(result[0].newField).toBe('added');
+    expect(result[1].title).toBe('Old B');
+    expect(result).toHaveLength(2);
+  });
+
+  // ── proxyGet ──────────────────────────────────────────────────────────────
+
+  test('proxyGet forwards request directly to Strapi with query string', async () => {
+    client.http.get = jest.fn().mockResolvedValue({ data: { data: [{ id: 1 }] } });
+    const result = await client.proxyGet('/api/pages', 'locale=en&sort=title');
+    expect(client.http.get).toHaveBeenCalledWith('/api/pages?locale=en&sort=title');
+    expect(result).toEqual({ data: [{ id: 1 }] });
+  });
+
+  test('proxyGet works without query string', async () => {
+    client.http.get = jest.fn().mockResolvedValue({ data: { items: [] } });
+    const result = await client.proxyGet('/api/pages', '');
+    expect(client.http.get).toHaveBeenCalledWith('/api/pages');
+    expect(result).toEqual({ items: [] });
+  });
+
+  // ── _fetchEntryEnvelope with rawQuery ────────────────────────────────────
+
+  test('_fetchEntryEnvelope uses rawQuery as base params when provided', async () => {
+    const calls = [];
+    client.http.get = jest.fn().mockImplementation((url) => {
+      calls.push(decodeURIComponent(url));
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      return Promise.resolve({
+        data: {
+          data: { id: 1, documentId: 'page-1', title: 'Home', locale: 'en' },
+          meta: { pagination: { page: 1, pageCount: 1, pageSize: 1, total: 1 } },
+        },
+      });
+    });
+
+    await client.fetchEntry('pages', { rawQuery: 'locale=fr&sort=title:asc' });
+
+    const phase1Call = calls.find((url) => url.includes('populate=*'));
+    expect(phase1Call).toContain('locale=fr');
+    expect(phase1Call).toContain('sort=title:asc');
+  });
+
+  // ── _fetchEntryEnvelope no entry found ───────────────────────────────────
+
+  test('fetchEntry throws when no entry is found', async () => {
+    client.http.get = jest.fn().mockResolvedValue({
+      data: { data: null, meta: {} },
+    });
+    await expect(client.fetchEntry('pages', { filters: { slug: '/missing/' } }))
+      .rejects.toThrow('No entry found');
+  });
+
+  // ── _fetchEntryEnvelope alwaysPopulateFields ──────────────────────────────
+
+  test('_fetchEntryEnvelope fetches alwaysPopulateFields missing from Phase 1', async () => {
+    const clientWithAlways = new StrapiClient({
+      baseUrl: 'http://localhost:1337',
+      token: '',
+      alwaysPopulateFields: ['seo_elements'],
+    });
+
+    const calls = [];
+    clientWithAlways.http.get = jest.fn().mockImplementation((url) => {
+      calls.push(decodeURIComponent(url));
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      return Promise.resolve({
+        data: {
+          data: { id: 1, documentId: 'page-1', title: 'Home' },
+          meta: { pagination: {} },
+        },
+      });
+    });
+
+    await clientWithAlways.fetchEntry('pages', { filters: { slug: '/' } });
+
+    const p1bCall = calls.find((url) => url.includes('populate[seo_elements]'));
+    expect(p1bCall).toBeTruthy();
+  });
+
+  // ── fetchByDocumentId alwaysPopulateFields ───────────────────────────────
+
+  test('fetchByDocumentId fetches alwaysPopulateFields missing from Phase 1', async () => {
+    const clientWithAlways = new StrapiClient({
+      baseUrl: 'http://localhost:1337',
+      token: '',
+      alwaysPopulateFields: ['seo_elements'],
+    });
+
+    const calls = [];
+    clientWithAlways.http.get = jest.fn().mockImplementation((url) => {
+      calls.push(decodeURIComponent(url));
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      return Promise.resolve({
+        data: { data: { id: 1, documentId: 'ci-1', title: 'Nav' } },
+      });
+    });
+
+    await clientWithAlways.fetchByDocumentId('component-instances', 'ci-1', 'en');
+
+    const p1bCall = calls.find((url) => url.includes('populate[seo_elements]'));
+    expect(p1bCall).toBeTruthy();
+  });
+
+  // ── fetchByDocumentId zone populate ─────────────────────────────────────
+
+  test('fetchByDocumentId runs zone populate when components field exists', async () => {
+    const calls = [];
+    client.http.get = jest.fn().mockImplementation((url) => {
+      calls.push(decodeURIComponent(url));
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      return Promise.resolve({
+        data: {
+          data: {
+            id: 1,
+            documentId: 'ci-1',
+            component_title: 'Nav',
+            components: [
+              { __component: 'components.nav', title: 'Nav bar' },
+            ],
+          },
+        },
+      });
+    });
+
+    await client.fetchByDocumentId('component-instances', 'ci-1', 'en');
+
+    const zoneCall = calls.find((url) => url.includes('populate[components][populate]'));
+    expect(zoneCall).toBeTruthy();
+  });
+
+  // ── fetchBatchByDocumentId empty array ───────────────────────────────────
+
+  test('fetchBatchByDocumentId returns empty object for empty input', async () => {
+    client.http.get = jest.fn();
+    const result = await client.fetchBatchByDocumentId('component-instances', [], 'en');
+    expect(result).toEqual({});
+    expect(client.http.get).not.toHaveBeenCalled();
+  });
+
+  // ── fetchBatchByDocumentId error handling ────────────────────────────────
+
+  test('fetchBatchByDocumentId handles individual fetch errors gracefully', async () => {
+    client.http.get = jest.fn().mockImplementation((url) => {
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      if (url.includes('ci-bad')) return Promise.reject(new Error('Network error'));
+      return Promise.resolve({
+        data: { data: { id: 1, documentId: 'ci-good', component_title: 'Good' } },
+      });
+    });
+
+    const result = await client.fetchBatchByDocumentId(
+      'component-instances', ['ci-good', 'ci-bad'], 'en'
+    );
+
+    expect(result['ci-good'].documentId).toBe('ci-good');
+    expect(result['ci-bad']).toBeNull();
+  });
+
+  // ── _mergeResponses edge cases ───────────────────────────────────────────
+
+  test('_mergeResponses handles undefined inputs', () => {
+    expect(client._mergeResponses(undefined, { a: 1 })).toEqual({ a: 1 });
+    expect(client._mergeResponses({ a: 1 }, undefined)).toEqual({ a: 1 });
+  });
+
+  test('_mergeResponses handles primitive vs object', () => {
+    expect(client._mergeResponses('old', 'new')).toBe('new');
+    expect(client._mergeResponses(null, { a: 1 })).toEqual({ a: 1 });
+    expect(client._mergeResponses({ a: 1 }, null)).toBeNull();
+  });
+
+  test('_mergeResponses handles array vs non-array mismatch', () => {
+    expect(client._mergeResponses([1, 2], 'string')).toBe('string');
+    expect(client._mergeResponses('string', [1, 2])).toEqual([1, 2]);
+  });
+
+  // ── fetchEntry iterative deepening ───────────────────────────────────────
+
+  test('_fetchEntryEnvelope runs iterative deepening passes until convergence', async () => {
+    let passCount = 0;
+    client.http.get = jest.fn().mockImplementation((url) => {
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+
+      passCount++;
+      if (passCount === 1) {
+        return Promise.resolve({
+          data: {
+            data: {
+              id: 1, documentId: 'page-1', title: 'Home',
+              section: { id: 2, documentId: 'sec-1' },
+            },
+            meta: { pagination: {} },
+          },
+        });
+      }
+      return Promise.resolve({
+        data: {
+          data: {
+            id: 1, documentId: 'page-1', title: 'Home',
+            section: { id: 2, documentId: 'sec-1', heading: 'Hero' },
+          },
+          meta: { pagination: {} },
+        },
+      });
+    });
+
+    const result = await client.fetchEntry('pages', { filters: { slug: '/' } });
+    const collectionCalls = client.http.get.mock.calls
+      .map((c) => c[0])
+      .filter((url) => url.includes('/api/pages'));
+    expect(collectionCalls.length).toBeGreaterThanOrEqual(2);
+    expect(result.section.heading).toBe('Hero');
+  });
+
+  // ── fetchEntryWithMeta ───────────────────────────────────────────────────
+
+  test('fetchEntryWithMeta returns entry and meta together', async () => {
+    client.http.get = jest.fn().mockImplementation((url) => {
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      return Promise.resolve({
+        data: {
+          data: { id: 1, documentId: 'page-1', title: 'Home', locale: 'en' },
+          meta: { pagination: { page: 1, pageCount: 1, pageSize: 25, total: 1 } },
+        },
+      });
+    });
+
+    const result = await client.fetchEntryWithMeta('pages', { filters: { slug: '/' }, locale: 'en' });
+    expect(result.entry).toBeDefined();
+    expect(result.meta.pagination.total).toBe(1);
+  });
+
+  // ── fetchByDocumentId non-zone iterative deepening ───────────────────────
+
+  test('fetchByDocumentId runs non-zone deepening passes when stubs are present', async () => {
+    let callCount = 0;
+    client.http.get = jest.fn().mockImplementation((url) => {
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      callCount++;
+      if (callCount === 1) {
+        // Phase 1: entity with a stub (no components zone)
+        return Promise.resolve({
+          data: {
+            data: {
+              id: 1, documentId: 'ci-1', component_title: 'Nav',
+              profile: { id: 2, documentId: 'profile-1' }, // stub — only system keys
+            },
+          },
+        });
+      }
+      // Non-zone deepening pass: return fully populated
+      return Promise.resolve({
+        data: {
+          data: {
+            id: 1, documentId: 'ci-1', component_title: 'Nav',
+            profile: { id: 2, documentId: 'profile-1', heading: 'My Profile' },
+          },
+        },
+      });
+    });
+
+    const result = await client.fetchByDocumentId('component-instances', 'ci-1', 'en');
+    expect(callCount).toBeGreaterThanOrEqual(2);
+    expect(result.profile.heading).toBe('My Profile');
+  });
+
+  // ── fetchByDocumentId Fragment API deepening ─────────────────────────────
+
+  test('fetchByDocumentId runs Fragment API deepening for dynamic zones with stubs', async () => {
+    let callCount = 0;
+    client.http.get = jest.fn().mockImplementation((url) => {
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      callCount++;
+      if (callCount === 1) {
+        // Phase 1: has components zone but shallow
+        return Promise.resolve({
+          data: {
+            data: {
+              id: 1, documentId: 'ci-1', component_title: 'Wrapper',
+              components: [{ __component: 'components.nav', title: 'Nav bar' }],
+            },
+          },
+        });
+      }
+      if (callCount === 2) {
+        // Zone populate: zone items now have a stub nested inside
+        return Promise.resolve({
+          data: {
+            data: {
+              id: 1, documentId: 'ci-1', component_title: 'Wrapper',
+              components: [{
+                __component: 'components.nav', title: 'Nav bar',
+                rows: [{ title: 'Row', link: { id: 3, documentId: 'link-1' } }],
+              }],
+            },
+          },
+        });
+      }
+      // Fragment deepening: fully populated
+      return Promise.resolve({
+        data: {
+          data: {
+            id: 1, documentId: 'ci-1', component_title: 'Wrapper',
+            components: [{
+              __component: 'components.nav', title: 'Nav bar',
+              rows: [{ title: 'Row', link: { id: 3, documentId: 'link-1', href: '/about' } }],
+            }],
+          },
+        },
+      });
+    });
+
+    const result = await client.fetchByDocumentId('component-instances', 'ci-1', 'en');
+    // Fragment deepening pass must have run
+    expect(callCount).toBeGreaterThanOrEqual(3);
+    const calls = client.http.get.mock.calls.map((c) => decodeURIComponent(c[0]));
+    expect(calls.some((u) => u.includes('populate[components][on]'))).toBe(true);
+  });
+
+  // ── _restoreLocalizations in fetchByDocumentId ───────────────────────────
+
+  test('fetchByDocumentId restores localizations wiped by zone populate', async () => {
+    let callCount = 0;
+    client.http.get = jest.fn().mockImplementation((url) => {
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      callCount++;
+      if (callCount === 1) {
+        // Phase 1: has localizations + components zone
+        return Promise.resolve({
+          data: {
+            data: {
+              id: 1, documentId: 'ci-1', component_title: 'Nav',
+              localizations: [{ id: 2, documentId: 'ci-1-hi', locale: 'hi' }],
+              components: [{ __component: 'components.nav', title: 'Nav bar' }],
+            },
+          },
+        });
+      }
+      // Zone populate wipes localizations
+      return Promise.resolve({
+        data: {
+          data: {
+            id: 1, documentId: 'ci-1', component_title: 'Nav',
+            localizations: [], // wiped
+            components: [{ __component: 'components.nav', title: 'Nav bar' }],
+          },
+        },
+      });
+    });
+
+    const result = await client.fetchByDocumentId('component-instances', 'ci-1', 'en', {
+      resolveLocalizations: false,
+    });
+    // _restoreLocalizations should have restored the saved localizations
+    expect(result.localizations).toHaveLength(1);
+    expect(result.localizations[0].locale).toBe('hi');
+  });
+
+  // ── localization restoration in _fetchEntryEnvelope ─────────────────────
+
+  test('_fetchEntryEnvelope restores localizations wiped by iterative deepening', async () => {
+    let callCount = 0;
+    client.http.get = jest.fn().mockImplementation((url) => {
+      if (url.includes('/api/i18n/locales')) return Promise.resolve({ data: [] });
+      callCount++;
+      const meta = { pagination: { page: 1, pageCount: 1, pageSize: 1, total: 1 } };
+      if (callCount === 1) {
+        // Phase 1: entry has localizations + a stub
+        return Promise.resolve({
+          data: {
+            data: {
+              id: 1, documentId: 'page-1', title: 'Home',
+              localizations: [{ id: 2, documentId: 'page-1-hi', locale: 'hi', title: 'होम' }],
+              section: { id: 2, documentId: 'sec-1' }, // stub
+            },
+            meta,
+          },
+        });
+      }
+      // Deepening: localizations wiped
+      return Promise.resolve({
+        data: {
+          data: {
+            id: 1, documentId: 'page-1', title: 'Home',
+            localizations: [], // wiped by deepening
+            section: { id: 2, documentId: 'sec-1', heading: 'Hero' },
+          },
+          meta,
+        },
+      });
+    });
+
+    const result = await client.fetchEntry('pages', {
+      filters: { slug: '/' },
+      maxDepth: 2, // finite depth so Phase 3 locale fetch is skipped
+    });
+    // localizations should be restored from Phase 1 data
+    expect(result.localizations).toHaveLength(1);
+    expect(result.localizations[0].locale).toBe('hi');
+  });
 });

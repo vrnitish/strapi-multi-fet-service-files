@@ -1,8 +1,9 @@
 /**
  * Strapi Page Resolver — Express HTTP Server
  *
- * Routes:
- *   GET  /:collection?<filters>&locale=en  → Resolved entry JSON
+ * Routes mirror Strapi's native REST API — use this service as a drop-in replacement:
+ *   GET  /api/:collection/:documentId?...  → Single document by documentId
+ *   GET  /api/:collection?...              → Filtered entry (or list all)
  *   POST /webhook/strapi                   → Cache invalidation on publish
  *   GET  /health                           → Health check
  */
@@ -53,31 +54,155 @@ function createServer(config) {
   });
 
   /**
-   * GET /:collection?<filters>&locale=en
-   * Mirrors Strapi's /api/:collection URL shape — use without the /api/ prefix.
-   * All query params except `locale` are treated as Strapi filters.
-   * locale defaults to 'en' when not provided.
+   * GET /api/:collection/:documentId?locale=en&depth=1
+   * Drop-in replacement for Strapi's /api/:collection/:documentId endpoint.
+   * If populate is present, proxies directly to Strapi.
+   * Otherwise uses depth pipeline.
    *
    * Examples:
-   *   GET /pages?slug=/my-page/
-   *   GET /pages?slug=/my-page/&locale=hi
-   *   GET /articles?category=tech&locale=hi
-   *   GET /landing-pages?slug=/promo/&site_code=adv
+   *   GET /api/pages/pc3advehph0ewmqh8lnoa0uu
+   *   GET /api/pages/pc3advehph0ewmqh8lnoa0uu?locale=hi
+   *   GET /api/pages/pc3advehph0ewmqh8lnoa0uu?depth=full
+   *   GET /api/pages/pc3advehph0ewmqh8lnoa0uu?populate=*
    */
-  app.get('/:collection', async (req, res) => {
+  app.get('/api/:collection/:documentId', async (req, res) => {
     const { collection } = req.params;
-    const { locale = 'en', ...filters } = req.query;
+    const documentId = req.params.documentId.replace(/\/$/, '');
+    const locale = req.query.locale || 'en';
 
-    if (Object.keys(filters).length === 0) {
-      return res.status(400).json({ error: 'At least one filter query param is required' });
+    // Raw query string without 'depth' (our custom param)
+    const rawQsFull = req.url.includes('?') ? req.url.split('?').slice(1).join('?') : '';
+    const rawQuery = rawQsFull.replace(/(?:^|&)depth=[^&]*/g, '').replace(/^&/, '');
+
+    // If populate present, proxy directly to Strapi
+    const hasPopulate = 'populate' in req.query;
+    if (hasPopulate) {
+      try {
+        const response = await strapiClient.proxyGet(`/api/${collection}/${documentId}`, rawQuery);
+        return res.json(response);
+      } catch (err) {
+        const strapiStatus = err.response?.status;
+        const strapiBody = err.response?.data;
+        console.error(`[Server] Proxy error ${collection}/${documentId}:`, err.message, strapiBody ? JSON.stringify(strapiBody) : '');
+        if (strapiStatus) return res.status(strapiStatus).json(strapiBody);
+        return res.status(502).json({ error: 'Upstream unreachable', message: err.message });
+      }
+    }
+
+    const { depth = '1' } = req.query;
+    let maxDepth;
+    if (depth === 'full') {
+      maxDepth = Infinity;
+    } else {
+      const parsed = parseInt(depth, 10);
+      if (isNaN(parsed) || parsed < 1 || String(parsed) !== String(depth)) {
+        return res.status(400).json({ error: 'depth must be a positive integer or "full"' });
+      }
+      maxDepth = parsed;
     }
 
     try {
-      const cacheKey = `${collection}:${JSON.stringify(filters)}`;
+      const cacheKey = `${collection}:${documentId}:${rawQuery}`;
       const cached = await cache.get(cacheKey, locale);
       if (cached) {
         res.set('X-Cache', 'HIT');
-        if (cached && Array.isArray(cached.data)) {
+        return res.json(Array.isArray(cached?.data) ? cached : { data: cached });
+      }
+
+      res.set('X-Cache', 'MISS');
+      const response = await resolver.resolveById(collection, documentId, locale, { maxDepth, rawQuery });
+      if (!response) {
+        return res.status(404).json({ error: `${collection} ${documentId} not found` });
+      }
+      await cache.set(cacheKey, locale, response);
+      return res.json(response);
+    } catch (err) {
+      const strapiStatus = err.response?.status;
+      const strapiBody = err.response?.data;
+      console.error(
+        `[Server] Error resolving ${collection}/${documentId}:`,
+        err.message,
+        strapiBody ? JSON.stringify(strapiBody) : ''
+      );
+
+      if (strapiStatus) return res.status(strapiStatus).json(strapiBody);
+      if (err.message.includes('not found')) return res.status(404).json({ error: err.message });
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * GET /api/:collection?<filters>&locale=en
+   * Drop-in replacement for Strapi's /api/:collection endpoint.
+   * Strapi-native filter syntax: ?filters[field][$eq]=value
+   * locale defaults to 'en' when not provided.
+   * Filters are optional — omitting them returns all entries (like Strapi's list endpoint).
+   *
+   * Examples:
+   *   GET /api/pages?filters[slug][$eq]=/my-page/
+   *   GET /api/pages?filters[slug][$eq]=/my-page/&locale=hi
+   *   GET /api/articles?filters[category][$eq]=tech&locale=hi
+   *   GET /api/component-instances  (list all)
+   */
+  app.get('/api/:collection', async (req, res) => {
+    const { collection } = req.params;
+    const locale = req.query.locale || 'en';
+
+    // Raw query string without 'depth' (our custom param)
+    const rawQsFull = req.url.includes('?') ? req.url.split('?').slice(1).join('?') : '';
+    const rawQuery = rawQsFull.replace(/(?:^|&)depth=[^&]*/g, '').replace(/^&/, '');
+
+    // If populate present, proxy directly to Strapi — skip depth pipeline
+    const hasPopulate = 'populate' in req.query;
+    if (hasPopulate) {
+      try {
+        const response = await strapiClient.proxyGet(`/api/${collection}`, rawQuery);
+        return res.json(response);
+      } catch (err) {
+        const strapiStatus = err.response?.status;
+        const strapiBody = err.response?.data;
+        console.error(`[Server] Proxy error ${collection}:`, err.message, strapiBody ? JSON.stringify(strapiBody) : '');
+        if (strapiStatus) return res.status(strapiStatus).json(strapiBody);
+        return res.status(502).json({ error: 'Upstream unreachable', message: err.message });
+      }
+    }
+
+    // depth omitted → 1 (populate=* only, fastest)
+    // depth=N       → N levels of deepening passes, no CI resolution
+    // depth=full    → full deep population + CI resolution
+    // depth=<other> → 400 error
+    const depth = req.query.depth || '1';
+    let maxDepth;
+    if (depth === 'full') {
+      maxDepth = Infinity;
+    } else {
+      const parsed = parseInt(depth, 10);
+      if (isNaN(parsed) || parsed < 1 || String(parsed) !== String(depth)) {
+        return res.status(400).json({ error: 'depth must be a positive integer or "full"' });
+      }
+      maxDepth = parsed;
+    }
+
+    // Extract filters (from parsed req.query) for backward compatibility.
+    // rawQuery is the authoritative source passed to Strapi; filters is used
+    // only for the cache key and resolver's internal error messages.
+    const filters = {};
+    if (req.query.filters && typeof req.query.filters === 'object') {
+      for (const [field, ops] of Object.entries(req.query.filters)) {
+        if (ops != null && typeof ops === 'object' && '$eq' in ops) {
+          filters[field] = ops['$eq'];
+        } else if (typeof ops === 'string') {
+          filters[field] = ops;
+        }
+      }
+    }
+
+    try {
+      const cacheKey = `${collection}:${rawQuery}`;
+      const cached = await cache.get(cacheKey, locale);
+      if (cached) {
+        res.set('X-Cache', 'HIT');
+        if (Array.isArray(cached?.data)) {
           return res.json(cached);
         }
         return res.json({
@@ -94,10 +219,11 @@ function createServer(config) {
       }
 
       res.set('X-Cache', 'MISS');
-      const response = await resolver.resolveWithMeta(collection, filters, locale);
+      const response = await resolver.resolveWithMeta(collection, filters, locale, { maxDepth, rawQuery });
       await cache.set(cacheKey, locale, response);
       return res.json(response);
     } catch (err) {
+      const strapiStatus = err.response?.status;
       const strapiBody = err.response?.data;
       console.error(
         `[Server] Error resolving ${collection}:`,
@@ -105,11 +231,9 @@ function createServer(config) {
         strapiBody ? JSON.stringify(strapiBody) : ''
       );
 
-      if (err.message.includes('not found')) {
-        return res.status(404).json({ error: err.message });
-      }
-
-      return res.status(500).json({ error: 'Internal server error' });
+      if (strapiStatus) return res.status(strapiStatus).json(strapiBody);
+      if (err.message.includes('not found')) return res.status(404).json({ error: err.message });
+      return res.status(500).json({ error: err.message });
     }
   });
 
@@ -148,7 +272,7 @@ function createServer(config) {
     }
   });
 
-  return { app, cache };
+  return { app, cache, strapiClient };
 }
 
 module.exports = createServer;

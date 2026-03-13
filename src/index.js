@@ -65,7 +65,7 @@ const config = {
 
 const { app, cache } = createServer(config);
 
-const server = app.listen(config.port, () => {
+const server = app.listen(config.port, '0.0.0.0', () => {
   console.log(`[Server] Strapi Page Resolver running on port ${config.port}`);
   console.log(`[Server] Strapi URL: ${config.strapiUrl}`);
   console.log(`[Server] Collection keys: ${JSON.stringify(config.collectionKeys)}`);

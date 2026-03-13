@@ -37,41 +37,71 @@ class PageResolver {
   /**
    * Generic entry point — works with any Strapi collection.
    */
-  async resolve(collection, filters = {}, locale = 'en') {
+  async resolve(collection, filters = {}, locale = 'en', opts = {}) {
+    const { maxDepth = Infinity, rawQuery = null } = opts;
     const startTime = Date.now();
 
-    const entry = await this.strapi.fetchEntry(collection, { filters, locale });
+    const entry = await this.strapi.fetchEntry(collection, { filters, locale, maxDepth, rawQuery });
     console.log(`[Resolver] ${collection} entry fetched in ${Date.now() - startTime}ms`);
 
-    // cache: "collection:documentId" → fully resolved data
-    const cache = {};
-    const resolved = await this._deepResolve(entry, locale, cache);
+    if (!Number.isFinite(maxDepth)) {
+      const cache = {};
+      const resolved = await this._deepResolve(entry, locale, cache);
+      console.log(`[Resolver] Done — ${Object.keys(cache).length} relation(s) resolved in ${Date.now() - startTime}ms`);
+      return resolved;
+    }
 
-    console.log(
-      `[Resolver] Done — ${Object.keys(cache).length} collection relation(s) resolved in ${Date.now() - startTime}ms`
-    );
-    return resolved;
+    console.log(`[Resolver] Done (depth=${maxDepth}) in ${Date.now() - startTime}ms`);
+    return entry;
   }
 
-  async resolveWithMeta(collection, filters = {}, locale = 'en') {
+  async resolveWithMeta(collection, filters = {}, locale = 'en', opts = {}) {
+    const { maxDepth = Infinity, rawQuery = null } = opts;
     const startTime = Date.now();
 
     const { entry, meta } = await this.strapi.fetchEntryWithMeta(collection, {
       filters,
       locale,
+      maxDepth,
+      rawQuery,
     });
     console.log(`[Resolver] ${collection} entry fetched in ${Date.now() - startTime}ms`);
 
-    const cache = {};
-    const resolved = await this._deepResolve(entry, locale, cache);
+    // entry may be an array (list result) or a single object (filtered result).
+    // _deepResolve handles both — it traverses arrays transparently.
+    const toArray = (v) => Array.isArray(v) ? v : [v];
 
-    console.log(
-      `[Resolver] Done — ${Object.keys(cache).length} collection relation(s) resolved in ${Date.now() - startTime}ms`
-    );
-    return {
-      data: [resolved],
-      meta: meta ?? this._defaultMeta(true),
-    };
+    if (!Number.isFinite(maxDepth)) {
+      const cache = {};
+      const resolved = await this._deepResolve(entry, locale, cache);
+      console.log(`[Resolver] Done — ${Object.keys(cache).length} relation(s) resolved in ${Date.now() - startTime}ms`);
+      return { data: toArray(resolved), meta: meta ?? this._defaultMeta(true) };
+    }
+
+    console.log(`[Resolver] Done (depth=${maxDepth}) in ${Date.now() - startTime}ms`);
+    return { data: toArray(entry), meta: meta ?? this._defaultMeta(true) };
+  }
+
+  /**
+   * Resolve a single document by documentId.
+   * Returns { data: entry } — mirrors Strapi's single-doc response shape.
+   */
+  async resolveById(collection, documentId, locale = 'en', opts = {}) {
+    const { maxDepth = Infinity, rawQuery = null } = opts;
+    const startTime = Date.now();
+
+    const entry = await this.strapi.fetchByDocumentId(collection, documentId, locale, { rawQuery });
+    if (!entry) return null;
+
+    if (!Number.isFinite(maxDepth)) {
+      const cache = {};
+      const resolved = await this._deepResolve(entry, locale, cache);
+      console.log(`[Resolver] Done — ${Object.keys(cache).length} relation(s) resolved in ${Date.now() - startTime}ms`);
+      return { data: resolved };
+    }
+
+    console.log(`[Resolver] Done (depth=${maxDepth}) in ${Date.now() - startTime}ms`);
+    return { data: entry };
   }
 
   // ─────────────────────────────────────────────────────────────────────────

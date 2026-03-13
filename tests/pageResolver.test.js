@@ -1,6 +1,6 @@
 /**
- * Tests validate the resolver against the real data shape from data/valid.json.
- * Mock data is derived programmatically from valid.json to ensure completeness.
+ * Tests validate the resolver against the real data shape from data/ files.
+ * Mock data is derived programmatically from the first available data file.
  */
 
 const PageResolver = require('../src/pageResolver');
@@ -9,9 +9,22 @@ const path = require('path');
 
 // ── Load reference data ─────────────────────────────────────────────────────
 
-const validJson = JSON.parse(
-  fs.readFileSync(path.join(__dirname, '..', 'data', 'valid.json'), 'utf8')
-);
+const DATA_DIR = path.join(__dirname, '..', 'data');
+
+function findFirstDataFile() {
+  for (const collection of fs.readdirSync(DATA_DIR)) {
+    const dir = path.join(DATA_DIR, collection);
+    if (!fs.statSync(dir).isDirectory()) continue;
+    const file = fs.readdirSync(dir).find((f) => f.endsWith('.json'));
+    if (file) return path.join(dir, file);
+  }
+  return null;
+}
+
+const dataFilePath = findFirstDataFile();
+if (!dataFilePath) throw new Error('No JSON files found in data/{collection}/ — add at least one data file');
+
+const validJson = JSON.parse(fs.readFileSync(dataFilePath, 'utf8'));
 const EXPECTED_PAGE = validJson.data[0];
 
 // ── Collection keys config for tests ────────────────────────────────────────
@@ -225,7 +238,7 @@ describe('PageResolver', () => {
 
   // ── Full resolution validation ──────────────────────────────────────────
 
-  test('resolved output matches valid.json reference data', async () => {
+  test('resolved output matches reference data', async () => {
     const result = await resolver.resolve('pages', { slug: '/dynamic/{{dynamic}}/' }, 'en');
     expect(result).toEqual(RESOLVED_EXPECTED);
   });
@@ -237,6 +250,8 @@ describe('PageResolver', () => {
     expect(mockClient.fetchEntry).toHaveBeenCalledWith('pages', {
       filters: { slug: '/dynamic/{{dynamic}}/' },
       locale: 'en',
+      maxDepth: Infinity,
+      rawQuery: null,
     });
   });
 
@@ -245,6 +260,8 @@ describe('PageResolver', () => {
     expect(mockClient.fetchEntry).toHaveBeenCalledWith('articles', {
       filters: { category: 'tech' },
       locale: 'en',
+      maxDepth: Infinity,
+      rawQuery: null,
     });
   });
 
@@ -253,6 +270,8 @@ describe('PageResolver', () => {
     expect(mockClient.fetchEntry).toHaveBeenCalledWith('pages', {
       filters: {},
       locale: 'en',
+      maxDepth: Infinity,
+      rawQuery: null,
     });
   });
 
@@ -266,6 +285,8 @@ describe('PageResolver', () => {
     expect(mockClient.fetchEntryWithMeta).toHaveBeenCalledWith('pages', {
       filters: { slug: '/dynamic/{{dynamic}}/' },
       locale: 'en',
+      maxDepth: Infinity,
+      rawQuery: null,
     });
     expect(result).toEqual({
       data: [RESOLVED_EXPECTED],
@@ -389,5 +410,113 @@ describe('PageResolver', () => {
     // localizations arrays should be passed through as-is, not scanned for relations
     const wrapper = result.layout[0].columns[0].component_instance;
     expect(wrapper.localizations).toBeDefined();
+  });
+
+  // ── _defaultMeta ──────────────────────────────────────────────────────
+
+  test('_defaultMeta(false) returns zero pagination', () => {
+    const meta = resolver._defaultMeta(false);
+    expect(meta.pagination.total).toBe(0);
+    expect(meta.pagination.pageCount).toBe(0);
+  });
+
+  // ── resolve() with finite maxDepth ───────────────────────────────────
+
+  test('resolve() with finite maxDepth skips CI resolution', async () => {
+    const result = await resolver.resolve('pages', { slug: '/' }, 'en', { maxDepth: 2 });
+    expect(mockClient.fetchBatchByDocumentId).not.toHaveBeenCalled();
+    expect(result).toBeDefined();
+  });
+
+  // ── resolveWithMeta() with finite maxDepth ───────────────────────────
+
+  test('resolveWithMeta() with finite maxDepth returns data array without resolution', async () => {
+    const result = await resolver.resolveWithMeta('pages', {}, 'en', { maxDepth: 1 });
+    expect(Array.isArray(result.data)).toBe(true);
+    expect(mockClient.fetchBatchByDocumentId).not.toHaveBeenCalled();
+  });
+
+  // ── resolveById() ─────────────────────────────────────────────────────
+
+  test('resolveById() resolves a document by ID and returns { data: resolved }', async () => {
+    mockClient.fetchByDocumentId = jest.fn().mockResolvedValue(
+      JSON.parse(JSON.stringify(PAGE_SHELL))
+    );
+    const result = await resolver.resolveById('pages', 'some-doc-id', 'en');
+    expect(result).toEqual({ data: RESOLVED_EXPECTED });
+    expect(mockClient.fetchByDocumentId).toHaveBeenCalledWith('pages', 'some-doc-id', 'en', { rawQuery: null });
+  });
+
+  test('resolveById() returns null when document not found', async () => {
+    mockClient.fetchByDocumentId = jest.fn().mockResolvedValue(null);
+    const result = await resolver.resolveById('pages', 'missing-id', 'en');
+    expect(result).toBeNull();
+  });
+
+  test('resolveById() with finite maxDepth skips CI resolution', async () => {
+    mockClient.fetchByDocumentId = jest.fn().mockResolvedValue({ id: 1, documentId: 'doc-1', title: 'Test' });
+    const result = await resolver.resolveById('pages', 'doc-1', 'en', { maxDepth: 2 });
+    expect(result).toEqual({ data: { id: 1, documentId: 'doc-1', title: 'Test' } });
+    expect(mockClient.fetchBatchByDocumentId).not.toHaveBeenCalled();
+  });
+
+  // ── _replaceCollectionStubs edge cases ───────────────────────────────
+
+  test('localizations inside localizations are not recursed (insideLocalizations guard)', async () => {
+    const result = await resolver.resolve('pages', { slug: '/' }, 'en');
+    const wrapper = result.layout[0].columns[0].component_instance;
+    expect(wrapper.localizations).toBeDefined();
+    expect(Array.isArray(wrapper.localizations)).toBe(true);
+  });
+
+  test('_replaceCollectionStubs skips nested localizations field when insideLocalizations=true', async () => {
+    // Line 212: when processing a localization entry, a nested 'localizations' key
+    // must be passed through as-is (not recursed into).
+    const shellWithNestedLoc = {
+      ...JSON.parse(JSON.stringify(PAGE_SHELL)),
+      localizations: [
+        {
+          id: 99,
+          documentId: 'loc-99',
+          locale: 'hi',
+          component_title: 'Nav HI',
+          // This localization entry itself has a localizations field — triggers line 212
+          localizations: [{ id: 100, documentId: 'loc-100', locale: 'fr' }],
+        },
+      ],
+    };
+    mockClient.fetchEntry.mockResolvedValueOnce(JSON.parse(JSON.stringify(shellWithNestedLoc)));
+
+    const result = await resolver.resolve('pages', { slug: '/' }, 'en');
+    // Nested localizations inside a localization entry must be passed through unchanged
+    expect(result.localizations[0].localizations).toEqual([
+      { id: 100, documentId: 'loc-100', locale: 'fr' },
+    ]);
+  });
+
+  test('_replaceCollectionStubs handles collection array item without documentId', async () => {
+    // Line 232: a component_instances array item that lacks documentId is recursed
+    // into normally rather than looked up in the cache.
+    const shellWithMixedItems = JSON.parse(JSON.stringify(PAGE_SHELL));
+    // Inject a component_instances array that has a non-stub item without documentId
+    shellWithMixedItems.no_doc_items = [
+      { id: 1, documentId: 'ci-a', component_title: 'A' }, // normal stub
+      { id: 2, title: 'plain object' },                    // no documentId — line 232
+    ];
+    // Temporarily map the field so the resolver treats it as a collection relation
+    mockClient.collectionKeys = {
+      ...mockClient.collectionKeys,
+      no_doc_items: 'component-instances',
+    };
+    mockClient.fetchEntry.mockResolvedValueOnce(JSON.parse(JSON.stringify(shellWithMixedItems)));
+
+    const result = await resolver.resolve('pages', { slug: '/' }, 'en');
+    expect(result).toBeDefined();
+    // The item without documentId should still be present (recursed into, not lost)
+    const plainItem = result.no_doc_items?.find((i) => i.title === 'plain object');
+    expect(plainItem).toBeDefined();
+
+    // Restore collectionKeys
+    mockClient.collectionKeys = COLLECTION_KEYS;
   });
 });
