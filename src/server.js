@@ -2,9 +2,9 @@
  * Strapi Page Resolver — Express HTTP Server
  *
  * Routes:
- *   GET  /resolve/:collection?<filters>&locale=en  → Resolved entry JSON
- *   POST /webhook/strapi                            → Cache invalidation on publish
- *   GET  /health                                    → Health check
+ *   GET  /:collection?<filters>&locale=en  → Resolved entry JSON
+ *   POST /webhook/strapi                   → Cache invalidation on publish
+ *   GET  /health                           → Health check
  */
 
 const express = require('express');
@@ -21,14 +21,20 @@ function createServer(config) {
     baseUrl: config.strapiUrl,
     token: config.strapiToken,
     timeout: config.strapiTimeout || 10000,
+    collectionKeys: config.collectionKeys || {},
     componentCollection: config.componentCollection,
     componentZoneField: config.componentZoneField,
     componentTypeField: config.componentTypeField,
     entityLabelField: config.entityLabelField,
     localizationField: config.localizationField,
+    locales: config.locales || null,
+    alwaysPopulateFields: config.alwaysPopulateFields || [],
   });
 
   const resolver = new PageResolver(strapiClient);
+
+  // Pre-fetch locales at startup so any permission error is visible immediately
+  strapiClient._fetchLocales();
 
   const cache = new CacheManager({
     enabled: config.cacheEnabled !== false,
@@ -39,16 +45,26 @@ function createServer(config) {
   // ── Routes ─────────────────────────────────────────────────────────────────
 
   /**
-   * GET /resolve/:collection?<filters>&locale=en
-   * Generic route — resolves any Strapi collection entry with full CI tree.
+   * GET /health
+   * Must be registered before /:collection to avoid being caught by it.
+   */
+  app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  });
+
+  /**
+   * GET /:collection?<filters>&locale=en
+   * Mirrors Strapi's /api/:collection URL shape — use without the /api/ prefix.
    * All query params except `locale` are treated as Strapi filters.
+   * locale defaults to 'en' when not provided.
    *
    * Examples:
-   *   GET /resolve/pages?slug=/my-page/&locale=en
-   *   GET /resolve/articles?category=tech&locale=hi
-   *   GET /resolve/landing-pages?slug=/promo/&site_code=adv
+   *   GET /pages?slug=/my-page/
+   *   GET /pages?slug=/my-page/&locale=hi
+   *   GET /articles?category=tech&locale=hi
+   *   GET /landing-pages?slug=/promo/&site_code=adv
    */
-  app.get('/resolve/:collection', async (req, res) => {
+  app.get('/:collection', async (req, res) => {
     const { collection } = req.params;
     const { locale = 'en', ...filters } = req.query;
 
@@ -130,13 +146,6 @@ function createServer(config) {
       console.error('[Webhook] Error:', err.message);
       return res.status(500).json({ error: 'Webhook processing failed' });
     }
-  });
-
-  /**
-   * GET /health
-   */
-  app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
   return { app, cache };

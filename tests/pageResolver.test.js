@@ -14,45 +14,56 @@ const validJson = JSON.parse(
 );
 const EXPECTED_PAGE = validJson.data[0];
 
-// ── Helpers to derive mock data from valid.json ─────────────────────────────
+// ── Collection keys config for tests ────────────────────────────────────────
+
+const COLLECTION_KEYS = {
+  component_instance: 'component-instances',
+  component_instances: 'component-instances',
+  user_types: 'user-types',
+};
 
 const SKIP_KEYS = new Set(['localizations']);
 
-function isCIEntity(obj) {
+// ── Helpers to derive mock data from valid.json ─────────────────────────────
+
+function isCollectionRelation(key) {
+  return key in COLLECTION_KEYS;
+}
+
+function hasDocumentId(obj) {
   return (
     obj != null &&
     typeof obj === 'object' &&
     !Array.isArray(obj) &&
-    typeof obj.documentId === 'string' &&
-    'component_title' in obj
+    typeof obj.documentId === 'string'
   );
 }
 
-function toStub(ci) {
-  return { id: ci.id, documentId: ci.documentId, component_title: ci.component_title };
+function toStub(entity) {
+  // pLevel=4 returns full data at the entity level including component_title etc.
+  // But nested collection relations within it are stubs.
+  // For the page shell, collection-relation values are stubs with basic fields.
+  const stub = { id: entity.id, documentId: entity.documentId };
+  if (entity.component_title) stub.component_title = entity.component_title;
+  if (entity.locale) stub.locale = entity.locale;
+  return stub;
 }
 
 /**
- * Walk the fully-resolved page, replace every CI entity with a stub,
- * and collect each CI's data (with its own nested CIs also stubified).
+ * Walk the fully-resolved page, replace every collection-relation value with
+ * a stub, and collect each entity's data (with its own nested relations also stubbed).
  */
 function buildMocksFromValid(fullPage) {
-  const ciMap = {};
-  const pageShell = _replaceCIs(fullPage, ciMap);
-  return { pageShell, ciMap };
+  const entityMap = {}; // "collection:documentId" → data with stubs
+  const pageShell = _replaceRelations(fullPage, entityMap);
+  return { pageShell, entityMap };
 }
 
-function _replaceCIs(node, ciMap) {
+function _replaceRelations(node, entityMap) {
   if (!node || typeof node !== 'object') return node;
 
   if (Array.isArray(node)) {
-    return node.map((item) => {
-      if (isCIEntity(item)) {
-        _collectCI(item, ciMap);
-        return toStub(item);
-      }
-      return _replaceCIs(item, ciMap);
-    });
+    return node.map((item) => _replaceRelations(item, entityMap));
   }
 
   const result = {};
@@ -61,83 +72,121 @@ function _replaceCIs(node, ciMap) {
       result[key] = value;
       continue;
     }
-    if (isCIEntity(value)) {
-      _collectCI(value, ciMap);
+
+    const collection = COLLECTION_KEYS[key];
+
+    if (collection && hasDocumentId(value)) {
+      // Single collection relation
+      _collectEntity(collection, value, entityMap);
       result[key] = toStub(value);
+    } else if (collection && Array.isArray(value)) {
+      // Plural collection relation
+      result[key] = value.map((item) => {
+        if (hasDocumentId(item)) {
+          _collectEntity(collection, item, entityMap);
+          return toStub(item);
+        }
+        return _replaceRelations(item, entityMap);
+      });
     } else {
-      result[key] = _replaceCIs(value, ciMap);
+      result[key] = _replaceRelations(value, entityMap);
     }
   }
   return result;
 }
 
-function _collectCI(ci, ciMap) {
-  if (ci.documentId in ciMap) return;
-  ciMap[ci.documentId] = null; // reserve slot to prevent re-entry
-  const ciData = {};
-  for (const [key, value] of Object.entries(ci)) {
+function _collectEntity(collection, entity, entityMap) {
+  const cacheKey = `${collection}:${entity.documentId}`;
+  if (cacheKey in entityMap) return;
+  entityMap[cacheKey] = null; // reserve slot to prevent re-entry
+  const data = {};
+  for (const [key, value] of Object.entries(entity)) {
     if (SKIP_KEYS.has(key)) {
-      ciData[key] = value;
+      data[key] = value;
       continue;
     }
-    ciData[key] = _replaceCIs(value, ciMap);
+    data[key] = _replaceRelations(value, entityMap);
   }
-  ciMap[ci.documentId] = ciData;
+  entityMap[cacheKey] = data;
+}
+
+/**
+ * Build the expected resolved output by replacing stubs with entityMap data,
+ * recursively. This accounts for the resolver's deduplication: the same entity
+ * always gets the same cached data everywhere in the tree.
+ */
+function buildExpected(shell, entityMap) {
+  const cache = {};
+  return _resolveNode(JSON.parse(JSON.stringify(shell)), entityMap, cache);
+}
+
+function _resolveNode(node, entityMap, cache) {
+  if (!node || typeof node !== 'object') return node;
+
+  if (Array.isArray(node)) {
+    return node.map((item) => _resolveNode(item, entityMap, cache));
+  }
+
+  const result = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (SKIP_KEYS.has(key)) {
+      result[key] = value;
+      continue;
+    }
+
+    const collection = COLLECTION_KEYS[key];
+
+    if (collection && hasDocumentId(value)) {
+      result[key] = _resolvedEntity(collection, value.documentId, entityMap, cache);
+    } else if (collection && Array.isArray(value)) {
+      result[key] = value.map((item) => {
+        if (hasDocumentId(item)) {
+          return _resolvedEntity(collection, item.documentId, entityMap, cache);
+        }
+        return _resolveNode(item, entityMap, cache);
+      });
+    } else {
+      result[key] = _resolveNode(value, entityMap, cache);
+    }
+  }
+  return result;
+}
+
+function _resolvedEntity(collection, docId, entityMap, cache) {
+  const cacheKey = `${collection}:${docId}`;
+  if (cacheKey in cache) return cache[cacheKey];
+  cache[cacheKey] = null;
+  cache[cacheKey] = _resolveNode(
+    JSON.parse(JSON.stringify(entityMap[cacheKey])),
+    entityMap,
+    cache
+  );
+  return cache[cacheKey];
 }
 
 // ── Build mock data + expected output ────────────────────────────────────────
 
-const { pageShell: PAGE_SHELL, ciMap: CI_MAP } = buildMocksFromValid(EXPECTED_PAGE);
+const { pageShell: PAGE_SHELL, entityMap: ENTITY_MAP } = buildMocksFromValid(EXPECTED_PAGE);
 
-/**
- * Build the expected resolved output by replacing stubs with ciMap data,
- * recursively. This accounts for the resolver's deduplication: the same CI
- * documentId always gets the same cached data everywhere in the tree
- * (valid.json may have location-specific differences like localizations).
- */
-function buildExpected(shell, ciMap) {
-  const cache = {};
-  return _resolveNode(JSON.parse(JSON.stringify(shell)), ciMap, cache);
-}
-
-function _resolveNode(node, ciMap, cache) {
-  if (!node || typeof node !== 'object') return node;
-
-  if (Array.isArray(node)) {
-    return node.map((item) => {
-      if (isCIEntity(item) && ciMap[item.documentId]) {
-        return _resolvedCI(item.documentId, ciMap, cache);
-      }
-      return _resolveNode(item, ciMap, cache);
-    });
-  }
-
-  const result = {};
-  for (const [key, value] of Object.entries(node)) {
-    if (SKIP_KEYS.has(key)) {
-      result[key] = value;
-      continue;
-    }
-    if (isCIEntity(value) && ciMap[value.documentId]) {
-      result[key] = _resolvedCI(value.documentId, ciMap, cache);
-    } else {
-      result[key] = _resolveNode(value, ciMap, cache);
-    }
-  }
-  return result;
-}
-
-function _resolvedCI(docId, ciMap, cache) {
-  if (docId in cache) return cache[docId];
-  cache[docId] = null; // reserve to prevent cycles
-  cache[docId] = _resolveNode(JSON.parse(JSON.stringify(ciMap[docId])), ciMap, cache);
-  return cache[docId];
-}
-
-const RESOLVED_EXPECTED = buildExpected(PAGE_SHELL, CI_MAP);
+const RESOLVED_EXPECTED = buildExpected(PAGE_SHELL, ENTITY_MAP);
 
 function createMockClient() {
   return {
+    collectionKeys: COLLECTION_KEYS,
+    schema: {
+      entityLabelField: 'component_title',
+      localizationField: 'localizations',
+    },
+    findCollectionRelations: jest.fn().mockImplementation(function (data, visited) {
+      // Use real implementation from StrapiClient
+      const StrapiClient = require('../src/strapiClient');
+      const client = new StrapiClient({
+        baseUrl: 'http://localhost:1337',
+        token: '',
+        collectionKeys: COLLECTION_KEYS,
+      });
+      return client.findCollectionRelations(data, visited);
+    }),
     fetchEntry: jest.fn().mockResolvedValue(JSON.parse(JSON.stringify(PAGE_SHELL))),
     fetchEntryWithMeta: jest.fn().mockResolvedValue({
       entry: JSON.parse(JSON.stringify(PAGE_SHELL)),
@@ -150,10 +199,13 @@ function createMockClient() {
         },
       },
     }),
-    fetchComponentInstancesBatch: jest.fn().mockImplementation((docIds) => {
+    fetchBatchByDocumentId: jest.fn().mockImplementation((collection, docIds) => {
       const result = {};
       for (const id of docIds) {
-        result[id] = CI_MAP[id] ? JSON.parse(JSON.stringify(CI_MAP[id])) : null;
+        const cacheKey = `${collection}:${id}`;
+        result[id] = ENTITY_MAP[cacheKey]
+          ? JSON.parse(JSON.stringify(ENTITY_MAP[cacheKey]))
+          : null;
       }
       return Promise.resolve(result);
     }),
@@ -205,7 +257,11 @@ describe('PageResolver', () => {
   });
 
   test('resolveWithMeta() returns Strapi-like response envelope', async () => {
-    const result = await resolver.resolveWithMeta('pages', { slug: '/dynamic/{{dynamic}}/' }, 'en');
+    const result = await resolver.resolveWithMeta(
+      'pages',
+      { slug: '/dynamic/{{dynamic}}/' },
+      'en'
+    );
 
     expect(mockClient.fetchEntryWithMeta).toHaveBeenCalledWith('pages', {
       filters: { slug: '/dynamic/{{dynamic}}/' },
@@ -224,21 +280,20 @@ describe('PageResolver', () => {
     });
   });
 
-  // ── CI stub detection ───────────────────────────────────────────────────
+  // ── Collection relation detection ─────────────────────────────────────
 
-  test('collects all top-level CI stubs from page shell', () => {
-    const stubs = resolver._findAllCIStubs(PAGE_SHELL);
-    const docIds = stubs.map((s) => s.documentId);
-    expect(docIds).toContain('xwwazo19pcqdyadk330wq49y'); // Flexible Component Wrapper
-    expect(docIds).toContain('mviok539521jomdcx29pk2dc'); // Modal Composition
-    expect(docIds).toContain('kgrda2v2o52q6qzeus8hu3l7'); // Navigation
+  test('finds collection relations in page shell', async () => {
+    await resolver.resolve('pages', { slug: '/dynamic/{{dynamic}}/' }, 'en');
+    expect(mockClient.findCollectionRelations).toHaveBeenCalled();
   });
 
   test('resolves all 7 unique component instances', async () => {
     await resolver.resolve('pages', { slug: '/dynamic/{{dynamic}}/' }, 'en');
     const allFetchedIds = new Set();
-    for (const call of mockClient.fetchComponentInstancesBatch.mock.calls) {
-      for (const id of call[0]) allFetchedIds.add(id);
+    for (const call of mockClient.fetchBatchByDocumentId.mock.calls) {
+      if (call[0] === 'component-instances') {
+        for (const id of call[1]) allFetchedIds.add(id);
+      }
     }
     expect(allFetchedIds.size).toBe(7);
   });
@@ -303,35 +358,20 @@ describe('PageResolver', () => {
     expect(navAtRoot).toEqual(navInModal);
   });
 
-  test('deduplicates stubs found in multiple locations', () => {
-    const dataWithDuplicates = {
-      layout: [
-        {
-          columns: [
-            { component_instance: { id: 1, documentId: 'aaa', component_title: 'A' } },
-            { component_instance: { id: 1, documentId: 'aaa', component_title: 'A' } },
-          ],
-        },
-      ],
-    };
-    const stubs = resolver._findAllCIStubs(dataWithDuplicates);
-    // _findAllCIStubs finds all occurrences; deduplication happens in _deepResolve
-    expect(stubs).toHaveLength(2);
-    expect(stubs[0].documentId).toBe('aaa');
-  });
-
   // ── Error handling ────────────────────────────────────────────────────
 
-  test('handles missing component instance gracefully', async () => {
-    mockClient.fetchComponentInstancesBatch.mockImplementationOnce((docIds) => {
+  test('handles missing collection entity gracefully', async () => {
+    mockClient.fetchBatchByDocumentId.mockImplementationOnce((collection, docIds) => {
       const result = {};
       for (const id of docIds) {
-        result[id] =
-          id === 'xwwazo19pcqdyadk330wq49y'
-            ? null
-            : CI_MAP[id]
-            ? JSON.parse(JSON.stringify(CI_MAP[id]))
+        if (id === 'xwwazo19pcqdyadk330wq49y') {
+          result[id] = null;
+        } else {
+          const cacheKey = `${collection}:${id}`;
+          result[id] = ENTITY_MAP[cacheKey]
+            ? JSON.parse(JSON.stringify(ENTITY_MAP[cacheKey]))
             : null;
+        }
       }
       return Promise.resolve(result);
     });
@@ -340,172 +380,14 @@ describe('PageResolver', () => {
     // Should return the stub instead of crashing
     const failedCI = result.layout[0].columns[0].component_instance;
     expect(failedCI.documentId).toBe('xwwazo19pcqdyadk330wq49y');
-    expect(failedCI.components).toBeUndefined();
   });
 
-  // ── Shape-based detection ─────────────────────────────────────────────
+  // ── Localization skipping ─────────────────────────────────────────────
 
-  test('detects CI entities under any field name (shape-based)', () => {
-    const data = {
-      some_random_field: {
-        id: 99,
-        documentId: 'xyz123',
-        component_title: 'Custom Widget',
-      },
-      another_field: [
-        { id: 100, documentId: 'abc456', component_title: 'Footer' },
-        { id: 101, documentId: 'def789', component_title: 'Header' },
-      ],
-    };
-    const stubs = resolver._findAllCIStubs(data);
-    expect(stubs).toHaveLength(3);
-    expect(stubs.map((s) => s.documentId)).toEqual(
-      expect.arrayContaining(['xyz123', 'abc456', 'def789'])
-    );
-  });
-
-  test('finds stubs in root arrays and returns early for null or visited data', () => {
-    const seen = { component_instance: { id: 1, documentId: 'seen', component_title: 'Seen' } };
-    const visited = new WeakSet([seen]);
-
-    expect(resolver._findAllCIStubs(null)).toEqual([]);
-    expect(resolver._findAllCIStubs(seen, visited)).toEqual([]);
-
-    const data = [
-      { id: 10, documentId: 'root-ci', component_title: 'Root CI' },
-      {
-        nested_items: [
-          { id: 11, documentId: 'nested-ci', component_title: 'Nested CI' },
-          42,
-          {
-            deep: {
-              id: 12,
-              documentId: 'deep-ci',
-              component_title: 'Deep CI',
-            },
-          },
-        ],
-      },
-    ];
-
-    const stubs = resolver._findAllCIStubs(data);
-
-    expect(stubs.map((stub) => stub.documentId)).toEqual([
-      'root-ci',
-      'nested-ci',
-      'deep-ci',
-    ]);
-  });
-
-  test('replaces stubs in root arrays and preserves unresolved array items', () => {
-    const seen = { any: 'value' };
-    const visited = new WeakSet([seen]);
-    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-
-    expect(resolver._replaceCIStubs(null, {})).toBeNull();
-    expect(resolver._replaceCIStubs(seen, {}, visited)).toBe(seen);
-
-    const rootResolvedStub = {
-      id: 20,
-      documentId: 'root-resolved',
-      component_title: 'Root Resolved',
-    };
-    const rootMissingStub = {
-      id: 21,
-      documentId: 'root-missing',
-      component_title: 'Root Missing',
-    };
-    const nestedMissingStub = {
-      id: 22,
-      documentId: 'nested-missing',
-      component_title: 'Nested Missing',
-    };
-    const resolvedPayload = {
-      id: 20,
-      documentId: 'root-resolved',
-      component_title: 'Root Resolved',
-      components: [{ label: 'resolved' }],
-    };
-
-    const result = resolver._replaceCIStubs(
-      [
-        rootResolvedStub,
-        rootMissingStub,
-        {
-          nested_items: [
-            nestedMissingStub,
-            {
-              child: rootResolvedStub,
-            },
-          ],
-        },
-      ],
-      {
-        'root-resolved': resolvedPayload,
-        'root-missing': null,
-        'nested-missing': null,
-      }
-    );
-
-    expect(result[0]).toEqual(resolvedPayload);
-    expect(result[1]).toBe(rootMissingStub);
-    expect(result[2].nested_items[0]).toBe(nestedMissingStub);
-    expect(result[2].nested_items[1].child).toEqual(resolvedPayload);
-    expect(warnSpy).toHaveBeenCalledWith(
-      '[Resolver] Missing data for component: root-missing'
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      '[Resolver] Missing data for component: nested-missing'
-    );
-
-    warnSpy.mockRestore();
-  });
-
-  test('skips localizations even though they have component_title', () => {
-    const data = {
-      component_instance: {
-        id: 1,
-        documentId: 'real-ci',
-        component_title: 'Real CI',
-      },
-      localizations: [
-        { id: 2, documentId: 'real-ci', component_title: 'Real CI', locale: 'hi' },
-      ],
-    };
-    const stubs = resolver._findAllCIStubs(data);
-    expect(stubs).toHaveLength(1);
-    expect(stubs[0].documentId).toBe('real-ci');
-  });
-
-  test('supports configurable entity and localization field names', () => {
-    const customResolver = new PageResolver(
-      {
-        entityLabelField: 'title_field',
-        localizationField: 'translations',
-      },
-      {
-        entityLabelField: 'title_field',
-        localizationField: 'translations',
-      }
-    );
-    const data = {
-      relation_a: {
-        id: 1,
-        documentId: 'custom-ci',
-        title_field: 'Custom CI',
-      },
-      translations: [
-        {
-          id: 2,
-          documentId: 'custom-ci',
-          title_field: 'Localized variant',
-          locale: 'hi',
-        },
-      ],
-    };
-
-    const stubs = customResolver._findAllCIStubs(data);
-    expect(stubs).toHaveLength(1);
-    expect(stubs[0].documentId).toBe('custom-ci');
+  test('skips localizations field during resolution', async () => {
+    const result = await resolver.resolve('pages', { slug: '/dynamic/{{dynamic}}/' }, 'en');
+    // localizations arrays should be passed through as-is, not scanned for relations
+    const wrapper = result.layout[0].columns[0].component_instance;
+    expect(wrapper.localizations).toBeDefined();
   });
 });

@@ -2,31 +2,24 @@
  * PageResolver
  *
  * Strategy:
- * 1. Fetch the page shell — layout tree iteratively deepened until
- *    component entities are visible at every level.
- * 2. Recursively resolve all component entities in the tree:
- *    - Detect them by shape, not relation field name
- *    - Batch-fetch them in parallel
- *    - Recursively resolve entities inside each fetched instance
- *    - Repeat until no new entities remain (handles any nesting depth)
- * 3. Replace every entity with its fully-resolved data.
+ *   1. Fetch the entry with populate=* + iterative deepening — gets all fields
+ *      including null/[] and populates nested relations to full depth.
+ *   2. Scan the response for collection relation keys (configured per-collection).
+ *      Collect all documentIds grouped by collection.
+ *   3. Batch-fetch all unique entities per collection in parallel (each with
+ *      populate=* + Fragment API + iterative deepening).
+ *   4. Replace stubs with resolved data and recurse — handles any nesting depth.
  *
- * The resolved cache (documentId → data) prevents duplicate fetches and
- * handles circular references safely.
+ * The resolved cache (collection:documentId → data) prevents duplicate fetches
+ * and handles circular references safely.
  */
 
 class PageResolver {
-  constructor(strapiClient, config = {}) {
+  constructor(strapiClient) {
     this.strapi = strapiClient;
     this.schema = {
-      entityLabelField:
-        config.entityLabelField ||
-        strapiClient?.schema?.entityLabelField ||
-        'component_title',
-      localizationField:
-        config.localizationField ||
-        strapiClient?.schema?.localizationField ||
-        'localizations',
+      entityLabelField: strapiClient?.schema?.entityLabelField || 'component_title',
+      localizationField: strapiClient?.schema?.localizationField || 'localizations',
     };
   }
 
@@ -41,30 +34,23 @@ class PageResolver {
     };
   }
 
-  async _resolveEntry(entry, collection, locale, startTime) {
-    // cache: documentId → fully resolved instance data (null = fetch failed)
-    const cache = {};
-    const resolved = await this._deepResolve(entry, locale, cache);
-
-    console.log(
-      `[Resolver] Done — ${Object.keys(cache).length} component instance(s) resolved in ${Date.now() - startTime}ms`
-    );
-    return resolved;
-  }
-
   /**
    * Generic entry point — works with any Strapi collection.
-   *
-   * @param {string} collection - Strapi collection plural name (e.g. 'pages', 'articles')
-   * @param {object} filters    - Strapi filter fields (e.g. { slug: '/my-page/' })
-   * @param {string} locale     - Locale code (default: 'en')
    */
   async resolve(collection, filters = {}, locale = 'en') {
     const startTime = Date.now();
 
     const entry = await this.strapi.fetchEntry(collection, { filters, locale });
     console.log(`[Resolver] ${collection} entry fetched in ${Date.now() - startTime}ms`);
-    return this._resolveEntry(entry, collection, locale, startTime);
+
+    // cache: "collection:documentId" → fully resolved data
+    const cache = {};
+    const resolved = await this._deepResolve(entry, locale, cache);
+
+    console.log(
+      `[Resolver] Done — ${Object.keys(cache).length} collection relation(s) resolved in ${Date.now() - startTime}ms`
+    );
+    return resolved;
   }
 
   async resolveWithMeta(collection, filters = {}, locale = 'en') {
@@ -76,7 +62,12 @@ class PageResolver {
     });
     console.log(`[Resolver] ${collection} entry fetched in ${Date.now() - startTime}ms`);
 
-    const resolved = await this._resolveEntry(entry, collection, locale, startTime);
+    const cache = {};
+    const resolved = await this._deepResolve(entry, locale, cache);
+
+    console.log(
+      `[Resolver] Done — ${Object.keys(cache).length} collection relation(s) resolved in ${Date.now() - startTime}ms`
+    );
     return {
       data: [resolved],
       meta: meta ?? this._defaultMeta(true),
@@ -88,154 +79,131 @@ class PageResolver {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Returns true if `obj` looks like a resolvable component entity.
-   * Detection is shape-based using configurable schema hints, not key-based.
-   */
-  _isCIEntity(obj) {
-    return (
-      obj != null &&
-      typeof obj === 'object' &&
-      !Array.isArray(obj) &&
-      typeof obj.documentId === 'string' &&
-      this.schema.entityLabelField in obj
-    );
-  }
-
-  /**
-   * Recursively resolve all component entities in `data`.
-   * Fetches in waves: collect all new entities → batch-fetch → recurse into
-   * each fetched instance → replace. Repeats until no new entities are found.
+   * Recursively resolve all collection relation stubs in `data`.
+   *
+   * Fetches in waves: scan tree for all collection relations → group by
+   * collection → batch-fetch new ones in parallel → replace stubs →
+   * recurse into fetched data until no new relations are found.
    */
   async _deepResolve(data, locale, cache) {
-    const stubs = this._findAllCIStubs(data);
-    const newIds = [...new Set(stubs.map((s) => s.documentId))].filter(
-      (id) => !(id in cache)
-    );
+    const relations = this.strapi.findCollectionRelations(data);
 
-    if (newIds.length === 0) {
-      return this._replaceCIStubs(data, cache);
+    // Deduplicate and find only new (unfetched) relations
+    const newByCollection = {};
+    for (const rel of relations) {
+      const cacheKey = `${rel.collection}:${rel.documentId}`;
+      if (cacheKey in cache) continue;
+      if (!newByCollection[rel.collection]) {
+        newByCollection[rel.collection] = new Set();
+      }
+      newByCollection[rel.collection].add(rel.documentId);
     }
 
-    console.log(`[Resolver] Fetching ${newIds.length} component instance(s)`);
+    const collections = Object.keys(newByCollection);
+    if (collections.length === 0) {
+      return this._replaceCollectionStubs(data, cache);
+    }
+
+    const totalNew = collections.reduce((sum, c) => sum + newByCollection[c].size, 0);
+    console.log(
+      `[Resolver] Fetching ${totalNew} relation(s) across ${collections.length} collection(s): ${collections.map((c) => `${c}(${newByCollection[c].size})`).join(', ')}`
+    );
 
     // Reserve cache slots before async work to prevent duplicate fetches
-    // in concurrent recursive calls (same id found in multiple branches).
-    for (const id of newIds) cache[id] = null;
+    for (const collection of collections) {
+      for (const docId of newByCollection[collection]) {
+        cache[`${collection}:${docId}`] = null;
+      }
+    }
 
-    const rawMap = await this.strapi.fetchComponentInstancesBatch(newIds, locale);
-
-    // Recursively resolve each fetched instance before inserting into cache.
-    // This handles nested CIs at any depth.
-    await Promise.all(
-      newIds.map(async (id) => {
-        if (rawMap[id]) {
-          cache[id] = await this._deepResolve(rawMap[id], locale, cache);
-        }
+    // Batch-fetch all collections in parallel
+    const batchResults = await Promise.all(
+      collections.map(async (collection) => {
+        const docIds = [...newByCollection[collection]];
+        const map = await this.strapi.fetchBatchByDocumentId(collection, docIds, locale);
+        return { collection, map };
       })
     );
 
-    return this._replaceCIStubs(data, cache);
+    // Recursively resolve each fetched entity
+    const resolvePromises = [];
+    for (const { collection, map } of batchResults) {
+      for (const [docId, rawData] of Object.entries(map)) {
+        if (rawData) {
+          resolvePromises.push(
+            this._deepResolve(rawData, locale, cache).then((resolved) => {
+              cache[`${collection}:${docId}`] = resolved;
+            })
+          );
+        }
+      }
+    }
+    await Promise.all(resolvePromises);
+
+    return this._replaceCollectionStubs(data, cache);
   }
 
   /**
-   * Walk the tree and collect every resolvable component entity.
-   * Detects by shape using configurable schema hints — works for any field name.
-   * Does not recurse into found entities — the resolver re-fetches them fully.
+   * Walk the tree and replace every collection relation stub with resolved data.
+   *
+   * @param {boolean} [insideLocalizations=false] - when true, we're inside a
+   *        localization entry — skip nested localizations to prevent infinite loops.
    */
-  _findAllCIStubs(data, visited = new WeakSet()) {
-    if (!data || typeof data !== 'object') return [];
-    if (visited.has(data)) return [];
-    visited.add(data);
-
-    const stubs = [];
-
-    if (Array.isArray(data)) {
-      for (const item of data) {
-        if (this._isCIEntity(item)) {
-          stubs.push(item);
-        } else {
-          stubs.push(...this._findAllCIStubs(item, visited));
-        }
-      }
-      return stubs;
-    }
-
-    for (const [key, value] of Object.entries(data)) {
-      if (!value || typeof value !== 'object') continue;
-      if (key === this.schema.localizationField) continue;
-
-      if (this._isCIEntity(value)) {
-        stubs.push(value);
-      } else if (Array.isArray(value)) {
-        for (const item of value) {
-          if (this._isCIEntity(item)) {
-            stubs.push(item);
-          } else if (item && typeof item === 'object') {
-            stubs.push(...this._findAllCIStubs(item, visited));
-          }
-        }
-      } else {
-        stubs.push(...this._findAllCIStubs(value, visited));
-      }
-    }
-
-    return stubs;
-  }
-
-  /**
-   * Walk the tree and replace every resolved component entity with the
-   * resolved data from cache. Falls back to the original on failure.
-   * Detection is shape-based using configurable schema hints.
-   */
-  _replaceCIStubs(data, cache, visited = new WeakSet()) {
+  _replaceCollectionStubs(data, cache, visited, insideLocalizations) {
+    visited = visited || new WeakSet();
+    insideLocalizations = insideLocalizations || false;
     if (!data || typeof data !== 'object') return data;
     if (visited.has(data)) return data;
     visited.add(data);
 
+    const locField = this.schema.localizationField;
+    const collectionKeys = this.strapi.collectionKeys;
+
     if (Array.isArray(data)) {
-      return data.map((item) => {
-        if (this._isCIEntity(item)) {
-          const resolved = cache[item.documentId];
-          if (resolved == null) {
-            console.warn(`[Resolver] Missing data for component: ${item.documentId}`);
-          }
-          return resolved ?? item;
-        }
-        return this._replaceCIStubs(item, cache, visited);
-      });
+      return data.map((item) => this._replaceCollectionStubs(item, cache, visited, insideLocalizations));
     }
 
     const result = {};
     for (const [key, value] of Object.entries(data)) {
-      if (!value || typeof value !== 'object') {
+      if (value == null || typeof value !== 'object') {
         result[key] = value;
         continue;
       }
 
-      if (key === this.schema.localizationField) {
-        result[key] = value;
-        continue;
-      }
-
-      if (this._isCIEntity(value)) {
-        const resolved = cache[value.documentId];
-        if (resolved == null) {
-          console.warn(`[Resolver] Missing data for component: ${value.documentId}`);
+      // Localizations: recurse into entries to resolve their collection
+      // stubs, but don't recurse into nested localizations (prevents
+      // infinite localizations.localizations... chains).
+      if (key === locField) {
+        if (!insideLocalizations && Array.isArray(value)) {
+          result[key] = value.map((item) =>
+            this._replaceCollectionStubs(item, cache, visited, true)
+          );
+        } else {
+          result[key] = value;
         }
+        continue;
+      }
+
+      const collection = collectionKeys[key];
+
+      if (collection && !Array.isArray(value) && value.documentId) {
+        // Single collection relation — replace with resolved data
+        const cacheKey = `${collection}:${value.documentId}`;
+        const resolved = cache[cacheKey];
         result[key] = resolved ?? value;
-      } else if (Array.isArray(value)) {
+      } else if (collection && Array.isArray(value)) {
+        // Plural collection relation — replace each item
         result[key] = value.map((item) => {
-          if (this._isCIEntity(item)) {
-            const resolved = cache[item.documentId];
-            if (resolved == null) {
-              console.warn(`[Resolver] Missing data for component: ${item.documentId}`);
-            }
+          if (item && typeof item === 'object' && item.documentId) {
+            const cacheKey = `${collection}:${item.documentId}`;
+            const resolved = cache[cacheKey];
             return resolved ?? item;
           }
-          return this._replaceCIStubs(item, cache, visited);
+          return this._replaceCollectionStubs(item, cache, visited, insideLocalizations);
         });
       } else {
-        result[key] = this._replaceCIStubs(value, cache, visited);
+        // Not a collection key — recurse
+        result[key] = this._replaceCollectionStubs(value, cache, visited, insideLocalizations);
       }
     }
 

@@ -8,8 +8,15 @@ describe('StrapiClient', () => {
       baseUrl: 'http://localhost:1337',
       token: '',
       timeout: 1000,
+      collectionKeys: {
+        component_instance: 'component-instances',
+        component_instances: 'component-instances',
+        user_types: 'user-types',
+      },
     });
   });
+
+  // ── Response merging ──────────────────────────────────────────────────────
 
   test('_mergeResponses keeps explicit null values from the newer payload', () => {
     const base = {
@@ -107,121 +114,342 @@ describe('StrapiClient', () => {
     });
   });
 
-  test('fetchEntryWithMeta preserves top-level meta and repopulates localizations', async () => {
-    client.maxPopulatePasses = 1;
-    client.http.get = jest
-      .fn()
-      .mockResolvedValueOnce({
-        data: {
-          data: [
+  // ── Collection relation detection ─────────────────────────────────────────
+
+  test('findCollectionRelations finds single and plural relations', () => {
+    const data = {
+      title: 'Page',
+      component_instance: {
+        id: 1,
+        documentId: 'ci-1',
+        component_title: 'Nav',
+      },
+      layout: [
+        {
+          columns: [
             {
-              id: 1,
-              documentId: 'page-1',
-              title: 'Home',
+              component_instance: {
+                id: 2,
+                documentId: 'ci-2',
+                component_title: 'Footer',
+              },
             },
           ],
-          meta: {
-            pagination: {
-              page: 1,
-              pageCount: 1,
-              pageSize: 25,
-              total: 1,
+        },
+      ],
+    };
+
+    const relations = client.findCollectionRelations(data);
+    const docIds = relations.map((r) => r.documentId);
+    expect(docIds).toContain('ci-1');
+    expect(docIds).toContain('ci-2');
+    expect(relations.every((r) => r.collection === 'component-instances')).toBe(true);
+  });
+
+  test('findCollectionRelations handles plural collection relation arrays', () => {
+    const data = {
+      components: [
+        {
+          __component: 'components.modal-wrapper',
+          component_instances: [
+            { id: 1, documentId: 'ci-a', component_title: 'A' },
+            { id: 2, documentId: 'ci-b', component_title: 'B' },
+          ],
+        },
+      ],
+    };
+
+    const relations = client.findCollectionRelations(data);
+    const docIds = relations.map((r) => r.documentId);
+    expect(docIds).toContain('ci-a');
+    expect(docIds).toContain('ci-b');
+  });
+
+  test('findCollectionRelations finds user_types relations', () => {
+    const data = {
+      auth: [
+        {
+          user_types: [
+            { id: 1, documentId: 'ut-1', name: 'Premium' },
+            { id: 2, documentId: 'ut-2', name: 'Free' },
+          ],
+        },
+      ],
+    };
+
+    const relations = client.findCollectionRelations(data);
+    expect(relations).toHaveLength(2);
+    expect(relations[0].collection).toBe('user-types');
+    expect(relations[1].collection).toBe('user-types');
+  });
+
+  test('findCollectionRelations recurses into localizations but not nested localizations', () => {
+    const data = {
+      component_instance: {
+        id: 1,
+        documentId: 'ci-1',
+        component_title: 'Nav',
+      },
+      localizations: [
+        {
+          id: 2,
+          documentId: 'loc-1',
+          component_title: 'Nav',
+          locale: 'hi',
+          // Collection relation inside a localization entry — should be found
+          component_instance: {
+            id: 3,
+            documentId: 'ci-2',
+            component_title: 'Footer',
+          },
+          // Nested localizations — should NOT be recursed into
+          localizations: [
+            {
+              id: 4,
+              documentId: 'loc-2',
+              component_instance: {
+                id: 5,
+                documentId: 'ci-3',
+                component_title: 'Should not find',
+              },
             },
+          ],
+        },
+      ],
+    };
+
+    const relations = client.findCollectionRelations(data);
+    const docIds = relations.map((r) => r.documentId);
+    // ci-1 from root, ci-2 from inside localization entry
+    expect(docIds).toContain('ci-1');
+    expect(docIds).toContain('ci-2');
+    // ci-3 inside nested localizations should NOT be found
+    expect(docIds).not.toContain('ci-3');
+  });
+
+  test('findCollectionRelations ignores non-collection keys with documentId', () => {
+    const data = {
+      random_object: {
+        id: 1,
+        documentId: 'random-1',
+        some_field: 'value',
+      },
+    };
+
+    const relations = client.findCollectionRelations(data);
+    expect(relations).toHaveLength(0);
+  });
+
+  // ── fetchByDocumentId with localizations ──────────────────────────────
+
+  // ── i18n locale discovery ─────────────────────────────────────────────────
+
+  test('_fetchLocales returns locale codes and caches the result', async () => {
+    client.http.get = jest.fn().mockResolvedValue({
+      data: [{ code: 'en', name: 'English' }, { code: 'hi', name: 'Hindi' }],
+    });
+
+    const first = await client._fetchLocales();
+    const second = await client._fetchLocales(); // must use cache
+
+    expect(first).toEqual(['en', 'hi']);
+    expect(second).toBe(first); // same reference — cached
+    expect(client.http.get).toHaveBeenCalledTimes(1);
+  });
+
+  test('_fetchLocales returns [] when API call fails', async () => {
+    client.http.get = jest.fn().mockRejectedValue(new Error('not found'));
+    const result = await client._fetchLocales();
+    expect(result).toEqual([]);
+  });
+
+  // ── fetchByDocumentId with localizations ──────────────────────────────
+
+  test('fetchByDocumentId fully populates localizations via i18n locales API (Phase 4)', async () => {
+    const calls = [];
+
+    client.http.get = jest.fn().mockImplementation((url) => {
+      calls.push(decodeURIComponent(url));
+
+      // i18n locales endpoint
+      if (url.includes('/api/i18n/locales')) {
+        return Promise.resolve({ data: [{ code: 'en' }, { code: 'hi' }] });
+      }
+
+      // Entity fetch — returns different data per locale, no localizations field
+      const isHi = url.includes('locale=hi');
+      return Promise.resolve({
+        data: {
+          data: {
+            id: isHi ? 2 : 1,
+            documentId: 'ci-1',
+            component_title: 'Nav',
+            locale: isHi ? 'hi' : 'en',
+            greeting: isHi ? 'namaste' : 'Hello',
+            localizations: [], // Strapi v5 often returns [] here
           },
         },
-      })
-      .mockResolvedValueOnce({
+      });
+    });
+
+    const result = await client.fetchByDocumentId('component-instances', 'ci-1', 'en');
+
+    // Main entity
+    expect(result.locale).toBe('en');
+    expect(result.greeting).toBe('Hello');
+
+    // Phase 4 used /api/i18n/locales to discover 'hi' and fetched it
+    expect(result.localizations).toHaveLength(1);
+    expect(result.localizations[0].locale).toBe('hi');
+    expect(result.localizations[0].greeting).toBe('namaste');
+
+    // Locales API was called
+    const localesCalls = calls.filter((url) => url.includes('/api/i18n/locales'));
+    expect(localesCalls.length).toBeGreaterThan(0);
+
+    // Phase 4 fetched hi locale
+    const hiCalls = calls.filter((url) => url.includes('locale=hi'));
+    expect(hiCalls.length).toBeGreaterThan(0);
+  });
+
+  test('fetchByDocumentId skips Phase 4 when resolveLocalizations is false', async () => {
+    const calls = [];
+
+    client.http.get = jest.fn().mockImplementation((url) => {
+      calls.push(decodeURIComponent(url));
+
+      if (url.includes('/api/i18n/locales')) {
+        return Promise.resolve({ data: [{ code: 'en' }, { code: 'hi' }] });
+      }
+
+      return Promise.resolve({
         data: {
-          data: [
-            {
+          data: {
+            id: 1,
+            documentId: 'ci-1',
+            component_title: 'Nav',
+            locale: 'en',
+            localizations: [],
+          },
+        },
+      });
+    });
+
+    const result = await client.fetchByDocumentId(
+      'component-instances', 'ci-1', 'en',
+      { resolveLocalizations: false }
+    );
+
+    // localizations should be whatever Strapi returned (empty in this case)
+    expect(result.localizations).toEqual([]);
+
+    // No hi-locale calls (Phase 4 was skipped)
+    const hiCalls = calls.filter((url) => url.includes('locale=hi'));
+    expect(hiCalls).toHaveLength(0);
+
+    // Locales API was NOT called
+    const localesCalls = calls.filter((url) => url.includes('/api/i18n/locales'));
+    expect(localesCalls).toHaveLength(0);
+  });
+
+  // ── Page-level localization resolution ───────────────────────────────────
+
+  test('fetchEntry populates page-level localizations via i18n locales API', async () => {
+    const calls = [];
+
+    client.http.get = jest.fn().mockImplementation((url) => {
+      calls.push(decodeURIComponent(url));
+
+      if (url.includes('/api/i18n/locales')) {
+        return Promise.resolve({ data: [{ code: 'en' }, { code: 'hi' }] });
+      }
+
+      // Collection list fetch (has filters query params)
+      if (url.includes('/api/pages?')) {
+        return Promise.resolve({
+          data: {
+            data: [{
               id: 1,
               documentId: 'page-1',
               title: 'Home',
-              localizations: [{ id: 2, documentId: 'page-2', locale: 'hi' }],
-            },
-          ],
-        },
-      });
+              locale: 'en',
+              localizations: [], // Strapi returns [] here
+            }],
+            meta: { pagination: { page: 1, pageCount: 1, pageSize: 1, total: 1 } },
+          },
+        });
+      }
 
-    const result = await client.fetchEntryWithMeta('pages', {
-      filters: { slug: '/home/' },
+      // Single document fetch by documentId
+      if (url.includes('/api/pages/page-1')) {
+        const isHi = url.includes('locale=hi');
+        return Promise.resolve({
+          data: {
+            data: {
+              id: isHi ? 2 : 1,
+              documentId: 'page-1',
+              title: isHi ? 'होम' : 'Home',
+              locale: isHi ? 'hi' : 'en',
+              seo: { metaTitle: isHi ? 'होम पेज' : 'Home Page' },
+              localizations: [],
+            },
+          },
+        });
+      }
+
+      return Promise.resolve({ data: { data: null } });
+    });
+
+    const result = await client.fetchEntry('pages', {
+      filters: { slug: '/' },
       locale: 'en',
     });
 
-    expect(result).toEqual({
-      entry: {
-        id: 1,
-        documentId: 'page-1',
-        title: 'Home',
-        localizations: [{ id: 2, documentId: 'page-2', locale: 'hi' }],
-      },
-      meta: {
-        pagination: {
-          page: 1,
-          pageCount: 1,
-          pageSize: 25,
-          total: 1,
-        },
-      },
-    });
-    expect(client.http.get.mock.calls[1][0]).toContain('populate%5Blocalizations%5D=*');
+    // Main entry
+    expect(result.locale).toBe('en');
+    expect(result.title).toBe('Home');
+
+    // Phase 3 used locales API to discover 'hi' and fetched the page in hi locale
+    expect(result.localizations).toHaveLength(1);
+    expect(result.localizations[0].locale).toBe('hi');
+    expect(result.localizations[0].title).toBe('होम');
+    expect(result.localizations[0].seo).toEqual({ metaTitle: 'होम पेज' });
+
+    // Locales API and hi-locale calls were made
+    const hiCalls = calls.filter((url) => url.includes('locale=hi'));
+    expect(hiCalls.length).toBeGreaterThan(0);
   });
 
-  test('fetchComponentInstance explicitly populates localizations', async () => {
-    client.maxPopulatePasses = 1;
-    client.http.get = jest.fn().mockResolvedValue({
-      data: {
+  // ── Batch fetch ──────────────────────────────────────────────────────────
+
+  test('fetchBatchByDocumentId fetches multiple in parallel', async () => {
+    client.http.get = jest.fn().mockImplementation((url) => {
+      // i18n locales — return empty so no localization fetches are made
+      if (url.includes('/api/i18n/locales')) {
+        return Promise.resolve({ data: [] });
+      }
+      const docId = url.match(/\/([^/?]+)\?/)?.[1];
+      return Promise.resolve({
         data: {
-          id: 1,
-          documentId: 'ci-1',
-          components: [],
-          localizations: [{ id: 2, documentId: 'ci-2', locale: 'hi' }],
+          data: {
+            id: 1,
+            documentId: docId,
+            component_title: `Component ${docId}`,
+          },
         },
-      },
+      });
     });
 
-    const result = await client.fetchComponentInstance('ci-1', 'en');
+    const result = await client.fetchBatchByDocumentId(
+      'component-instances',
+      ['ci-1', 'ci-2'],
+      'en'
+    );
 
-    expect(result.localizations).toEqual([{ id: 2, documentId: 'ci-2', locale: 'hi' }]);
-    // Phase 1 (broad) includes localizations populate
-    expect(client.http.get.mock.calls[0][0]).toContain('populate%5Blocalizations%5D=*');
-    // Phase 2 (zone) also includes localizations populate
-    expect(client.http.get.mock.calls[1][0]).toContain('populate%5Blocalizations%5D=*');
-    expect(client.http.get.mock.calls[1][0]).toContain('populate%5Bcomponents%5D%5Bpopulate%5D=*');
-  });
-
-  test('supports configurable schema field names and collection names', async () => {
-    const customClient = new StrapiClient({
-      baseUrl: 'http://localhost:1337',
-      token: '',
-      timeout: 1000,
-      localizationField: 'translations',
-      componentTypeField: 'kind',
-      componentZoneField: 'blocks',
-      componentCollection: 'widgets',
-    });
-
-    customClient.maxPopulatePasses = 1;
-    customClient.http.get = jest.fn().mockResolvedValue({
-      data: {
-        data: {
-          id: 1,
-          documentId: 'widget-1',
-          blocks: [],
-          translations: [{ id: 2, documentId: 'widget-2', locale: 'hi' }],
-        },
-      },
-    });
-
-    const result = await customClient.fetchComponentInstance('widget-1', 'en');
-
-    expect(result.translations).toEqual([{ id: 2, documentId: 'widget-2', locale: 'hi' }]);
-    // Phase 1: broad populate=*
-    expect(customClient.http.get.mock.calls[0][0]).toContain('/api/widgets/widget-1?');
-    expect(customClient.http.get.mock.calls[0][0]).toContain('populate=*');
-    expect(customClient.http.get.mock.calls[0][0]).toContain('populate%5Btranslations%5D=*');
-    // Phase 2: zone-specific populate
-    expect(customClient.http.get.mock.calls[1][0]).toContain('populate%5Bblocks%5D%5Bpopulate%5D=*');
-    expect(customClient.http.get.mock.calls[1][0]).toContain('populate%5Btranslations%5D=*');
+    expect(result['ci-1'].documentId).toBe('ci-1');
+    expect(result['ci-2'].documentId).toBe('ci-2');
+    // Each fetchByDocumentId makes 1 Phase-1 request (populate=*)
+    // plus 1 shared/cached i18n/locales call → 2×1 + 1 = 3
+    expect(client.http.get).toHaveBeenCalledTimes(3);
   });
 });

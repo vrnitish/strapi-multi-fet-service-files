@@ -36,7 +36,6 @@ function getSystemKeys(schema = {}) {
     'publishedAt',
     'locale',
     normalized.componentTypeField,
-    normalized.localizationField,
   ]);
 }
 
@@ -120,6 +119,8 @@ function collectStubPaths(data, { segments = [], visited = new WeakSet(), schema
     return paths;
   }
 
+  const normalized = normalizeSchema(schema);
+
   for (const [key, value] of Object.entries(data)) {
     if (systemKeys.has(key) || value === null || value === undefined) continue;
     // Always stop at dynamic zones — Strapi requires Fragment API for those
@@ -127,6 +128,15 @@ function collectStubPaths(data, { segments = [], visited = new WeakSet(), schema
     if (stopAtEntities && shouldStopAtValue(value, schema)) continue;
 
     const nextSegments = [...segments, key];
+
+    // Localizations: add path for deepening but never recurse into it —
+    // prevents infinite localizations.localizations.localizations... chains.
+    if (key === normalized.localizationField) {
+      if (Array.isArray(value) && value.length > 0 && value.every((item) => isStub(item, schema))) {
+        paths.push(nextSegments);
+      }
+      continue;
+    }
 
     if (Array.isArray(value)) {
       const items = value.filter(Boolean);
@@ -180,6 +190,8 @@ function collectDeepPaths(data, { segments = [], visited = new WeakSet(), schema
     return paths;
   }
 
+  const normalized = normalizeSchema(schema);
+
   for (const [key, value] of Object.entries(data)) {
     if (systemKeys.has(key) || value == null) continue;
     // Always stop at dynamic zones — Strapi requires Fragment API for those
@@ -187,6 +199,20 @@ function collectDeepPaths(data, { segments = [], visited = new WeakSet(), schema
     if (stopAtEntities && shouldStopAtValue(value, schema)) continue;
 
     const nextSegments = [...segments, key];
+
+    // Localizations: add path for deepening but never recurse into it —
+    // prevents infinite localizations.localizations.localizations... chains.
+    if (key === normalized.localizationField) {
+      if (Array.isArray(value)) {
+        const realObjs = value.filter(
+          (v) => v && typeof v === 'object' && !Array.isArray(v) && !isStub(v, schema)
+        );
+        if (realObjs.length > 0) {
+          paths.push(nextSegments);
+        }
+      }
+      continue;
+    }
 
     if (Array.isArray(value)) {
       const realObjs = value.filter(
